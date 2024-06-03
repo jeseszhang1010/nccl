@@ -8,6 +8,9 @@
 #ifndef NCCL_TUNER_H_
 #define NCCL_TUNER_H_
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <float.h>
 #include "nccl.h"
 
 typedef enum {NCCL_LOG_NONE=0, NCCL_LOG_VERSION=1, NCCL_LOG_WARN=2, NCCL_LOG_INFO=3, NCCL_LOG_ABORT=4, NCCL_LOG_TRACE=5} ncclDebugLogLevel;
@@ -78,5 +81,130 @@ typedef struct {
 typedef ncclTuner_v2_t ncclTuner_t;
 
 #define NCCL_TUNER_PLUGIN_SYMBOL "ncclTunerPlugin_v2"
+
+// Latencies in us, Bandwidths in GB/s
+// Tree { LL, LL128, Simple } , Ring { LL, LL128, Simple }
+// Base algorithm latencies
+static const float nccl_base_lat[NCCL_NUM_ALGORITHMS][NCCL_NUM_PROTOCOLS] = {
+        {  6.8, 14.0,    0 }, // Tree
+        {  6.6, 14.0,  8.4 }, // Ring
+        {    0,    0,    0 }, // Collnet Direct
+        {    0,    0,    0 }, // Collne Chain
+        {    0,    0,    0 }, // NVLS
+        {    0,    0,    0 }  // NVLS Tree
+};
+
+// NVLink
+static float nccl_nvlink_lat[NCCL_NUM_ALGORITHMS][NCCL_NUM_PROTOCOLS] = {
+       { .6, 1.25,  28 }, /* Tree (LL/LL128/Simple)*/
+       { .6,  1.9, 3.4 }, /* Ring (LL/LL128/Simple)*/
+       {  0,    0, 3.7 }, /* CollNetDirect (Simple)*/
+       {  0,    0, 2.8 }, /* CollNetChain (Simple)*/
+       {  0,    0,  25 }, /* NVLS (Simple) */
+       {  0,    0,  25 }  /* NVLSTree (Simple) */
+};
+
+#define NCCL_TUNER_NET_LAT			(3)
+#define NCCL_TUNER_NET_NUM_CHANNELS	(16)
+#define NCCL_TUNER_INTERNODE_BW		(50.0 * 1024ULL * 1024ULL * 1024ULL * 1e-6)
+
+/*
+ * For Hopper GPUs, all intranode communication goes over NVLink, so use
+ * the bandwidth for SM90 architecture in NCCL (SM90_NVLINK_BW).
+ *
+ * This is unidirectional bandwidth per NVLink (900GB/s bidirectional on the
+ * platform, with 18 NVLinks in total. NCCL considers a 20% protocol overhead,
+ * leaving 20GB/s bandwidth per link).
+ */
+#define NCCL_TUNER_INTRANODE_BW		(20.0 * 1024 * 1024 * 1024 * 1e-6)
+
+struct nccl_tuner_model_params {
+    float net_lat;
+	float internode_bw;
+	float intranode_bw;
+	int num_channels;
+};
+
+struct nccl_tuner_model_dims {
+	int num_ranks;
+	int num_nodes;
+};
+
+struct nccl_tuner_context {
+	struct nccl_tuner_model_dims dims;
+	struct nccl_tuner_model_params params;
+};
+
+
+static long log2i(long n) {
+	long l = 0;
+	while (n>>=1) l++;
+	return l;
+}
+
+float nccl_tuner_compute_cost(struct nccl_tuner_model_params *params, struct nccl_tuner_model_dims *dims,
+                                  ncclFunc_t func, int algo, int proto, int pipe_ops, size_t size)
+{
+	float cost = -1;
+	float latency = 0;
+	float bw = 0;
+	float intraLat = 0;
+	float interLat = 0;
+	int num_steps = 0;
+	int num_internode_steps = 0;
+	int num_intranode_steps = 0;
+
+	latency = nccl_base_lat[algo][proto];
+	intraLat = nccl_nvlink_lat[algo][proto];
+	interLat = params->net_lat;
+
+	// Also add the flush extra latency
+    //if (p == NCCL_PROTO_SIMPLE) interLat += graphs[a]->latencyInter;
+
+	switch(func) {
+	case ncclFuncAllReduce:
+		switch(algo) {
+		case NCCL_ALGO_RING:
+			num_steps = 2 * (dims->num_ranks - 1);
+			num_internode_steps = 2 * dims->num_nodes;
+			num_intranode_steps = num_steps - num_internode_steps;
+			latency += num_internode_steps * interLat + num_intranode_steps * intraLat;
+			bw = params->internode_bw * params->num_channels;
+			break;
+
+		case NCCL_ALGO_TREE:
+			latency += 2 * (((dims->num_ranks / dims->num_nodes) - 1) * intraLat
+					+ log2i(dims->num_nodes) * interLat);
+			bw = params->internode_bw * params->num_channels / 2;
+			break;
+
+		case NCCL_ALGO_NVLS_TREE:
+			latency += intraLat + 2 * log2i(dims->num_nodes) * interLat;
+			bw = params->internode_bw * params->num_channels / 2;
+			break;
+
+		default:
+			printf("Algorithm %d for collective %d without a model.", algo, func);
+			return -1;
+		}
+		break;
+
+	default:
+		return -1;
+	}
+
+	/* Penalize the low-latency protocol bandwidths for their overhead */
+	if (proto == NCCL_PROTO_LL)
+		/* 8B total with 4B data and 4B flags, so take a 50% hit */
+		bw *= 0.5;
+	else if (proto == NCCL_PROTO_LL128)
+		/* 120B data and 8B flags */
+		bw *= 0.9375;
+
+	// cost model calculation
+	cost = (latency * pipe_ops) + size / bw;
+
+	return cost;
+}
 
 #endif
