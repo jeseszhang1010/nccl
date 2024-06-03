@@ -6,7 +6,7 @@
 NCCL_HOME:=../../build/
 CUDA_HOME:=/usr/local/cuda
 INC:= -I$(NCCL_HOME)/include -I$(CUDA_HOME)/include -Inccl
-PLUGIN_SO:=libnccl-tuner.so
+PLUGIN_SO:=libnccl-tuner-azure.so
 
 default: $(PLUGIN_SO)
 
