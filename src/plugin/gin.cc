@@ -351,6 +351,8 @@ static int ncclGetBackendPriority(struct ncclGinBackendState* backend) {
   case NCCL_GIN_TYPE_EFA_GDA:
   case NCCL_GIN_TYPE_GPI:
     return 2;
+  case NCCL_GIN_TYPE_MRC:
+    return 3;
   default:
     return INT_MAX;
   }
