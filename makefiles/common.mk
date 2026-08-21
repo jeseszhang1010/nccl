@@ -145,6 +145,20 @@ NVLDFLAGS  := -L${CUDA_LIB} -lcudart -lrt
 NVCUFLAGS_SYM :=
 NVCUFLAGS_GENK :=
 
+########## MRC GIN backend ##########
+# Opt-in with GIN_MRC=1. Selects the MRC GIN device backend and disables GDAKI: the two vendor
+# different DOCA device-header snapshots that use the same include guards, so only one can be
+# present per translation unit. This adds a define only -- no DOCA include path and no DOCA
+# library is linked into libnccl; the MRC GIN host plugin owns all of that.
+GIN_MRC ?= 0
+ifeq ($(GIN_MRC),1)
+  GIN_MRC_FLAGS := -DNCCL_GIN_MRC_ENABLE=1
+  CXXFLAGS      += $(GIN_MRC_FLAGS)
+  NVCUFLAGS     += $(GIN_MRC_FLAGS)
+  NVCUFLAGS_SYM += $(GIN_MRC_FLAGS)
+endif
+########## MRC GIN backend ##########
+
 ########## GCOV ##########
 GCOV ?= 0 # disable by default.
 GCOV_FLAGS := $(if $(filter 0,${GCOV} ${DEBUG}),,--coverage) # only gcov=1 and debug =1
