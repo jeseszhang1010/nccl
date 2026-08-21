@@ -78,7 +78,8 @@ typedef enum {
   NCCL_GIN_TYPE_GDAKI = 3, // intentionally not 2. Must match NCCL_NET_DEVICE_GIN_GDAKI for backward compatibility
   NCCL_GIN_TYPE_GPI = 4, // Must match NCCL_NET_DEVICE_GIN_GPI
   NCCL_GIN_TYPE_EFA_GDA = 5, // Must match NCCL_NET_DEVICE_GIN_EFA_GDA for backward compatibility
-  NCCL_GIN_MAX_TYPES = 6,
+  NCCL_GIN_TYPE_MRC = 6, // Must match NCCL_NET_DEVICE_GIN_MRC
+  NCCL_GIN_MAX_TYPES = 7,
 } ncclGinType_t;
 
 typedef enum {
