@@ -24,6 +24,7 @@ const int proxyBackendMinVersions[] = {0, NCCL_VERSION(2, 30, 3), NCCL_VERSION(2
 const int gdakiBackendMinVersions[] = {0, NCCL_VERSION(2, 30, 3), NCCL_VERSION(2, 30, 5)};
 const int gpiBackendMinVersions[] = {0, NCCL_VERSION(2, 30, 5)};
 constexpr int efaGdaBackendMinVersions[] = {0, NCCL_VERSION(2, 31, 0), NCCL_VERSION(2, 32, 0)};
+const int mrcBackendMinVersions[] = {0, NCCL_VERSION(2, 31, 2)};
 
 ncclResult_t ncclGetGinType(struct ncclComm* comm, ncclGinType_t* ginType) {
   if (comm == nullptr || ginType == nullptr) return ncclInternalError;
@@ -334,6 +335,10 @@ static ncclResult_t ginDevCommSetupWithBackend(
   case NCCL_GIN_TYPE_EFA_GDA:
     backendVersionArray = efaGdaBackendMinVersions;
     nVersions = sizeof(efaGdaBackendMinVersions) / sizeof(int);
+    break;
+  case NCCL_GIN_TYPE_MRC:
+    backendVersionArray = mrcBackendMinVersions;
+    nVersions = sizeof(mrcBackendMinVersions) / sizeof(int);
     break;
   default:
     WARN("Cannot get backend version for unsupported GIN type %d", backend->ginType);

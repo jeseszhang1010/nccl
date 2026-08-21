@@ -1439,6 +1439,16 @@ static void ncclDevCommEfaGdaDump(void* handle) {
   printf("    EFA_GDA handle %p\n", handle);
 }
 
+#include "nccl_device/gin/mrc/gin_mrc_dev.h"
+static void ncclDevCommMrcDump(void* handle) {
+  struct ncclGinMrcGPUContext ctx;
+  if (cudaMemcpy(&ctx, handle, sizeof(ctx), cudaMemcpyDeviceToHost) == cudaSuccess) {
+    printf("    MRC qps %p rq %p sink lkey %x\n", ctx.qps, ctx.rq, ctx.sink_lkey);
+    printf("    MRC signals %p rkeys %p sink offset %u counters %p\n", ctx.signals, ctx.signal_rkeys,
+           ctx.signals_sink_offset, ctx.counters);
+  }
+}
+
 #include "nccl_device/gin/proxy/gin_proxy_device_host_common.h"
 static void ncclDevCommProxyDump(void* handle) {
   ncclGinProxyGpuCtx_t ctx;
@@ -1453,6 +1463,9 @@ static void ncclDevCommGdakiDump(void* handle) {
 }
 static void ncclDevCommEfaGdaDump(void* handle) {
   printf("    EFA_GDA handle %p (detailed dump not available on Windows)\n", handle);
+}
+static void ncclDevCommMrcDump(void* handle) {
+  printf("    MRC handle %p (detailed dump not available on Windows)\n", handle);
 }
 static void ncclDevCommProxyDump(void* handle) {
   printf("    PROXY handle %p (detailed dump not available on Windows)\n", handle);
@@ -1474,6 +1487,7 @@ void ncclDevCommDump(struct ncclDevComm* devComm) {
     printf("   [%d] %d %p\n", c, devComm->ginNetDeviceTypes[c], devComm->ginHandles[c]);
     if (devComm->ginNetDeviceTypes[c] == NCCL_GIN_TYPE_GDAKI) ncclDevCommGdakiDump(devComm->ginHandles[c]);
     if (devComm->ginNetDeviceTypes[c] == NCCL_GIN_TYPE_EFA_GDA) ncclDevCommEfaGdaDump(devComm->ginHandles[c]);
+    if (devComm->ginNetDeviceTypes[c] == NCCL_GIN_TYPE_MRC) ncclDevCommMrcDump(devComm->ginHandles[c]);
     if (devComm->ginNetDeviceTypes[c] == NCCL_GIN_TYPE_PROXY) ncclDevCommProxyDump(devComm->ginHandles[c]);
   }
   printf("  Signals  %d shadows %p\n", devComm->ginSignalCount, devComm->ginSignalShadows);
