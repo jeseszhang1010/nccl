@@ -207,6 +207,14 @@ template <ncclNetDeviceType backend>
 struct ncclGinApi_BarrierOptions {
   NCCL_DEVICE_INLINE static ncclGinBarrierOptions_t call(ncclGinCtx);
 };
+
+// Best-effort, non-blocking progress hook invoked from the signal/counter wait loops. The
+// default is a no-op; a backend that must poll hardware to make locally-observable progress
+// (e.g. MRC draining its receive CQ to apply Write-with-Immediate signals) specializes it.
+template <ncclNetDeviceType backend>
+struct ncclGinApi_Progress {
+  NCCL_DEVICE_INLINE static void call(ncclGinCtx) {}
+};
 #endif
 
 #ifdef __CUDACC__
