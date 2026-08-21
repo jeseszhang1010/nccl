@@ -15,6 +15,9 @@
 #if NCCL_GIN_EFA_GDA_ENABLE
 #include "efa_gda/gin_efa_gda.h"
 #endif
+#if NCCL_GIN_MRC_ENABLE
+#include "mrc/gin_mrc.h"
+#endif
 #if NCCL_GIN_PROXY_ENABLE
 #include "proxy/gin_proxy.h"
 #endif
