@@ -116,8 +116,8 @@ $(GIT_VERSION_FILE): ALWAYS_REBUILD
 	@python3 ./misc/generate_git_version.py $@
 
 # DOCA GPUNetIO definitions
-DOCA_HOME        ?= transport/net_ib/gdaki/doca-gpunetio
 DOCA_INC_INSTALL := $(INCDIR)/nccl_device/gin/gdaki/doca_gpunetio
+DOCA_HOME        ?= transport/net_ib/gdaki/doca-gpunetio
 DOCA_OBJDIR      := $(OBJDIR)/transport/net_ib/gdaki/doca-gpunetio
 DOCA_INCLUDES    := $(DOCA_HOME)/include/doca_gpunetio_device.h $(wildcard $(DOCA_HOME)/include/common/*.h) $(wildcard $(DOCA_HOME)/include/device/*.cuh)
 DOCA_INCTARGETS  := $(DOCA_INCLUDES:$(DOCA_HOME)/include/%=$(DOCA_INC_INSTALL)/%)
@@ -126,6 +126,7 @@ DOCA_LIBSRC      := doca_verbs_qp.cpp doca_verbs_cq.cpp doca_verbs_device_attr.c
 DOCA_LIBSRC      += gpu_dev_compat/doca_gpunetio_dev_compat.cpp gpu_dev_compat/doca_gpunetio_dev_verbs_v1.cpp
 DOCA_LIBOBJ      := $(DOCA_LIBSRC:%.cpp=$(DOCA_OBJDIR)/%.o)
 LIBOBJ           += $(DOCA_LIBOBJ)
+DOCA_CXXINC      := -I$(DOCA_HOME)/include
 
 # EFA-DP-Direct device header installation (mirrors DOCA pattern above)
 EFA_DP_DIRECT_HOME        := transport/net_efa_gda/efa-dp-direct
@@ -133,6 +134,16 @@ EFA_DP_DIRECT_INC_INSTALL := $(INCDIR)/nccl_device/transport/net_efa_gda/efa-dp-
 EFA_DP_DIRECT_INCLUDES    := $(wildcard $(EFA_DP_DIRECT_HOME)/include/device/*.cuh) $(wildcard $(EFA_DP_DIRECT_HOME)/include/device/*.h) $(wildcard $(EFA_DP_DIRECT_HOME)/include/common/*.h)
 EFA_DP_DIRECT_INCTARGETS  := $(EFA_DP_DIRECT_INCLUDES:$(EFA_DP_DIRECT_HOME)/include/%=$(EFA_DP_DIRECT_INC_INSTALL)/include/%)
 INCTARGETS                += $(EFA_DP_DIRECT_INCTARGETS)
+
+# Vendored DOCA GPUNetIO device headers for the MRC GIN backend. Device-only and header-only:
+# nothing here is compiled or linked into libnccl. The install path mirrors the source layout so
+# the relative include in include/nccl_device/gin/mrc/gin_mrc.h resolves in the install tree,
+# letting applications compile the MRC device backend with only -I<nccl>/include.
+MRC_DOCA_HOME        := transport/net_mrc/doca-gpunetio-rcx
+MRC_DOCA_INC_INSTALL := $(INCDIR)/nccl_device/transport/net_mrc/doca-gpunetio-rcx
+MRC_DOCA_INCLUDES    := $(wildcard $(MRC_DOCA_HOME)/include/*.h) $(wildcard $(MRC_DOCA_HOME)/include/*.cuh)
+MRC_DOCA_INCTARGETS  := $(MRC_DOCA_INCLUDES:$(MRC_DOCA_HOME)/include/%=$(MRC_DOCA_INC_INSTALL)/include/%)
+INCTARGETS           += $(MRC_DOCA_INCTARGETS)
 
 ##### rules
 build : lib staticlib binary
@@ -247,6 +258,21 @@ $(INCDIR)/nccl_device/gin/efa_gda/%.h: include/nccl_device/gin/efa_gda/%.h
 	mkdir -p $(INCDIR)/nccl_device/gin/efa_gda
 	install -m 644 $< $@
 
+$(INCDIR)/nccl_device/gin/mrc/%.h: include/nccl_device/gin/mrc/%.h
+	@printf "Grabbing   %-35s > %s\n" $< $@
+	mkdir -p $(INCDIR)/nccl_device/gin/mrc
+	install -m 644 $< $@
+
+$(MRC_DOCA_INC_INSTALL)/include/%.cuh: $(MRC_DOCA_HOME)/include/%.cuh
+	@printf "Grabbing   %-35s > %s\n" $< $@
+	mkdir -p $(MRC_DOCA_INC_INSTALL)/include
+	install -m 644 $< $@
+
+$(MRC_DOCA_INC_INSTALL)/include/%.h: $(MRC_DOCA_HOME)/include/%.h
+	@printf "Grabbing   %-35s > %s\n" $< $@
+	mkdir -p $(MRC_DOCA_INC_INSTALL)/include
+	install -m 644 $< $@
+
 $(EFA_DP_DIRECT_INC_INSTALL)/include/device/%.cuh: $(EFA_DP_DIRECT_HOME)/include/device/%.cuh
 	@printf "Grabbing   %-35s > %s\n" $< $@
 	mkdir -p $(EFA_DP_DIRECT_INC_INSTALL)/include/device
@@ -290,8 +316,8 @@ $(OBJDIR)/ras/ras_param_client.o: ras/ras_param.cc $(INCTARGETS)
 $(OBJDIR)/%.o : %.cc $(INCTARGETS)
 	@printf "Compiling  %-35s > %s\n" $< $@
 	mkdir -p `dirname $@`
-	$(CXX) -I. -I$(INCDIR) -I$(OBJDIR)/include -Iinclude -I$(INCPLUGIN) $(CXXFLAGS) -I$(DOCA_HOME)/include -c $< -o $@
-	@$(CXX) -I. -I$(INCDIR) -I$(OBJDIR)/include -Iinclude -I$(INCPLUGIN) $(CXXFLAGS) -I$(DOCA_HOME)/include -MM $< > $(@:%.o=%.d.tmp)
+	$(CXX) -I. -I$(INCDIR) -I$(OBJDIR)/include -Iinclude -I$(INCPLUGIN) $(CXXFLAGS) $(DOCA_CXXINC) -c $< -o $@
+	@$(CXX) -I. -I$(INCDIR) -I$(OBJDIR)/include -Iinclude -I$(INCPLUGIN) $(CXXFLAGS) $(DOCA_CXXINC) -MM $< > $(@:%.o=%.d.tmp)
 	@sed "0,/^.*:/s//$(subst /,\/,$@):/" $(@:%.o=%.d.tmp) > $(@:%.o=%.d)
 	@sed -e 's/.*://' -e 's/\\$$//' < $(@:%.o=%.d.tmp) | fmt -1 | \
                 sed -e 's/^ *//' -e 's/$$/:/' >> $(@:%.o=%.d)
