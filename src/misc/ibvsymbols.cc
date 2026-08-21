@@ -116,7 +116,10 @@ ncclResult_t buildIbvSymbols(struct ncclIbvSymbols* ibvSymbols) {
   LOAD_SYM(ibvhandle, "ibv_query_device", ibvSymbols->ibv_internal_query_device);
   LOAD_SYM(ibvhandle, "ibv_query_port", ibvSymbols->ibv_internal_query_port);
   LOAD_SYM(ibvhandle, "ibv_query_gid", ibvSymbols->ibv_internal_query_gid);
-  LOAD_SYM(ibvhandle, "ibv_query_pkey", ibvSymbols->ibv_internal_query_pkey);
+  // Optional: some shim/compat verbs providers (e.g. RoCE-only shims with no pkey table) don't
+  // export this. It is only invoked when NCCL_IB_PKEY_VALUE is explicitly set, so a missing
+  // binding must not abort the whole IB plugin the way the mandatory LOAD_SYM would.
+  LOAD_SYM_VERSION(ibvhandle, "ibv_query_pkey", ibvSymbols->ibv_internal_query_pkey, IBVERBS_VERSION);
   LOAD_SYM(ibvhandle, "ibv_query_qp", ibvSymbols->ibv_internal_query_qp);
   LOAD_SYM(ibvhandle, "ibv_alloc_pd", ibvSymbols->ibv_internal_alloc_pd);
   LOAD_SYM(ibvhandle, "ibv_dealloc_pd", ibvSymbols->ibv_internal_dealloc_pd);
