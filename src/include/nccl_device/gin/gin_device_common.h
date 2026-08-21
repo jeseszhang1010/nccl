@@ -29,12 +29,25 @@
 #endif
 #endif
 
+// MRC is opt-in: it vendors a newer DOCA snapshot whose device headers carry the same include
+// guards as the GDAKI copy, so at most one of the two can be present per translation unit.
+// Building with -DNCCL_GIN_MRC_ENABLE=1 selects MRC and turns GDAKI off.
+#ifndef NCCL_GIN_MRC_ENABLE
+#define NCCL_GIN_MRC_ENABLE 0
+#endif
+
 #ifndef NCCL_GIN_GDAKI_ENABLE
-#if CUDA_VERSION >= 12020 && __CUDA_ARCH__ >= 700
+#if NCCL_GIN_MRC_ENABLE
+#define NCCL_GIN_GDAKI_ENABLE 0
+#elif CUDA_VERSION >= 12020 && __CUDA_ARCH__ >= 700
 #define NCCL_GIN_GDAKI_ENABLE 1
 #else
 #define NCCL_GIN_GDAKI_ENABLE 0
 #endif
+#endif
+
+#if NCCL_GIN_MRC_ENABLE && NCCL_GIN_GDAKI_ENABLE
+#error "NCCL_GIN_MRC_ENABLE and NCCL_GIN_GDAKI_ENABLE are mutually exclusive: their vendored DOCA device headers collide."
 #endif
 
 #ifndef NCCL_GIN_EFA_GDA_ENABLE
@@ -55,7 +68,8 @@ enum ncclGinOptFlags {
   (((NCCL_GIN_PROXY_ENABLE) ? 1u : 0u) << (unsigned)NCCL_NET_DEVICE_GIN_PROXY | \
    ((NCCL_GIN_GDAKI_ENABLE) ? 1u : 0u) << (unsigned)NCCL_NET_DEVICE_GIN_GDAKI | \
    ((NCCL_GIN_GPI_ENABLE) ? 1u : 0u) << (unsigned)NCCL_NET_DEVICE_GIN_GPI | \
-   ((NCCL_GIN_EFA_GDA_ENABLE) ? 1u : 0u) << (unsigned)NCCL_NET_DEVICE_GIN_EFA_GDA)
+   ((NCCL_GIN_EFA_GDA_ENABLE) ? 1u : 0u) << (unsigned)NCCL_NET_DEVICE_GIN_EFA_GDA | \
+   ((NCCL_GIN_MRC_ENABLE) ? 1u : 0u) << (unsigned)NCCL_NET_DEVICE_GIN_MRC)
 
 #ifdef __CUDACC__
 // Resource sharing mode for a given ncclGin instance.
@@ -241,6 +255,11 @@ NCCL_DEVICE_INLINE static decltype(auto) ncclGinCallImpl(unsigned beMask, ncclGi
   case (int)NCCL_NET_DEVICE_GIN_EFA_GDA:
     if (!(1 & (beMask >> (int)NCCL_NET_DEVICE_GIN_EFA_GDA))) __builtin_unreachable();
     return ApiFn<NCCL_NET_DEVICE_GIN_EFA_GDA>::call(ctx, static_cast<Arg&&>(arg)...);
+#endif
+#if NCCL_GIN_MRC_ENABLE
+  case (int)NCCL_NET_DEVICE_GIN_MRC:
+    if (!(1 & (beMask >> (int)NCCL_NET_DEVICE_GIN_MRC))) __builtin_unreachable();
+    return ApiFn<NCCL_NET_DEVICE_GIN_MRC>::call(ctx, static_cast<Arg&&>(arg)...);
 #endif
   default:
     __builtin_unreachable();
