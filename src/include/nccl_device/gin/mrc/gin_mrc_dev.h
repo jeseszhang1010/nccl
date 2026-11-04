@@ -18,6 +18,15 @@
 
 #include <stdint.h>
 
+// How receive WQEs are posted/reposted (ncclGinMrcRqState::post_mode). Selected by the host
+// plugin at runtime via NCCL_GIN_MRC_RQ_POST_MODE.
+//   DBR:  lightweight. The ring is filled once with immutable notification WQEs and a consumed
+//         slot is "reposted" by advancing only the RQ doorbell record.
+//   WQE:  regular post-recv (the device-side equivalent of mrc_post_recv): reserve the RQ slot,
+//         rewrite its WQE, mark it ready and submit it through the RQ doorbell path.
+#define NCCL_GIN_MRC_RQ_POST_MODE_DBR 0
+#define NCCL_GIN_MRC_RQ_POST_MODE_WQE 1
+
 // Per-peer drain state. MRC QPs have no atomics, so a peer's signal arrives as an RDMA
 // Write-with-Immediate and the receiver drains its receive CQ to observe it;
 // consumer_index is the running count of consumed receive CQEs.
@@ -39,6 +48,7 @@ struct ncclGinMrcRqState {
   // device-scope lock (0=free, 1=held) serializes the per-peer drain: racing on
   // consumer_index regresses it and silently drops signal increments.
   int drain_lock;
+  uint32_t post_mode; // NCCL_GIN_MRC_RQ_POST_MODE_*
 };
 
 struct ncclGinMrcGPUContext {
