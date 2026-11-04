@@ -72,17 +72,43 @@ NCCL_DEVICE_INLINE static doca_gpu_dev_verbs_qp* getQp(ncclGinMrcGPUContext* mrc
 
 /* ── Receive queue: one-time fill and non-blocking drain ──────────── */
 
-// Fill the whole receive ring with immutable zero-SGE notification WQEs and ring the RQ
-// doorbell. Must be called exactly once per QP by a single thread before any peer issues a
-// Write-with-Immediate to this QP. counter_slots/counter_capacity install this QP's send-CQ
-// counter-drain table; pass counter_slots == nullptr to disable counter support.
+// Regular post-recv of `count` notification WQEs (NCCL_GIN_MRC_RQ_POST_MODE_WQE): reserve the
+// RQ slots, write each WQE, mark them ready and submit through the RQ doorbell path, which also
+// tracks the RQ producer index. Single-threaded per QP. No availability wait is needed: callers
+// only post into slots that are either never used (init) or whose completion was just consumed.
+NCCL_DEVICE_INLINE static uint64_t rqPostRecv(struct doca_gpu_dev_verbs_qp* qp, uint32_t count) {
+  const uint64_t base = doca_gpu_dev_verbs_reserve_wq_slots<
+    DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_EXCLUSIVE, DOCA_GPUNETIO_VERBS_QP_RQ, false>(qp, count);
+  for (uint32_t idx = 0; idx < count; idx++) {
+    struct mlx5_wqe_data_seg* rwqe = doca_gpu_dev_verbs_get_rwqe_ptr(qp, base + idx);
+    doca_gpu_dev_verbs_wqe_prepare_recv(qp, rwqe, 0, doca_gpu_dev_verbs_bswap32(kRecvInvalidLkey), 0);
+  }
+  doca_gpu_dev_verbs_mark_wqes_ready<
+    DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_EXCLUSIVE, DOCA_GPUNETIO_VERBS_QP_RQ>(qp, base, base + count - 1);
+  // The exclusive-mode submit does not order the WQE stores ahead of the DBR store.
+  doca_gpu_dev_verbs_fence_release<DOCA_GPUNETIO_VERBS_SYNC_SCOPE_GPU>();
+  // The RQ has no BlueFlame/proxy path: always submit through the DBR, whatever the QP's SQ handler.
+  doca_gpu_dev_verbs_submit<
+    DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_EXCLUSIVE, DOCA_GPUNETIO_VERBS_SYNC_SCOPE_GPU,
+    DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_DB, DOCA_GPUNETIO_VERBS_QP_RQ>(qp, base + count);
+  return base;
+}
+
+// Fill the whole receive ring with zero-SGE notification WQEs and ring the RQ doorbell. Must be
+// called exactly once per QP by a single thread before any peer issues a Write-with-Immediate to
+// this QP. counter_slots/counter_capacity install this QP's send-CQ counter-drain table; pass
+// counter_slots == nullptr to disable counter support. post_mode (NCCL_GIN_MRC_RQ_POST_MODE_*)
+// selects how the ring is posted here and reposted by rqPollOne.
 NCCL_DEVICE_INLINE void rqInit(struct doca_gpu_dev_verbs_qp* qp, struct ncclGinMrcRqState* state,
-                               uint32_t* counter_slots, uint32_t counter_capacity) {
+                               uint32_t* counter_slots, uint32_t counter_capacity,
+                               uint32_t post_mode = NCCL_GIN_MRC_RQ_POST_MODE_DBR) {
   const uint32_t rqDepth = qp->rq_wqe_num;
   state->consumer_index = 0;
   state->rq_depth = rqDepth;
   state->status = 0;
   state->drain_lock = 0;
+  state->post_mode = post_mode == NCCL_GIN_MRC_RQ_POST_MODE_WQE ? NCCL_GIN_MRC_RQ_POST_MODE_WQE
+                                                                : NCCL_GIN_MRC_RQ_POST_MODE_DBR;
 
   // The slot table must be a power-of-two at least as large as the SQ ring so that every
   // outstanding WQE index maps to a unique slot; disable counters otherwise.
@@ -96,6 +122,11 @@ NCCL_DEVICE_INLINE void rqInit(struct doca_gpu_dev_verbs_qp* qp, struct ncclGinM
   } else {
     state->counter_slots = nullptr;
     state->sq_wqe_mask = 0;
+  }
+
+  if (state->post_mode == NCCL_GIN_MRC_RQ_POST_MODE_WQE) {
+    if (rqPostRecv(qp, rqDepth) != 0) state->status = -1;
+    return;
   }
 
   const uint64_t base = doca_gpu_dev_verbs_reserve_wq_slots<
@@ -121,14 +152,7 @@ NCCL_DEVICE_INLINE void rqInit(struct doca_gpu_dev_verbs_qp* qp, struct ncclGinM
 // CQE was consumed (and replenishes the RQ slot), EBUSY when none is pending, or a negative
 // errno when the CQE reports an error (also latched in state->status).
 //
-// May be called concurrently by many threads/CTAs sharing a context (e.g. every CTA's barrier
-// wait calls ncclGinApi_Progress on ctx 0). Two threads can then race on the same completion:
-// both may observe it valid and both bump consumer_index to the same value, so the completion
-// is double-counted (harmless: signals only ever need to reach a monotonic threshold, so an
-// extra increment can only make a wait succeed sooner, never blocks one). Deliberately not
-// serialized with a lock/CAS: an earlier attempt at that starved the drain entirely under the
-// heavy per-iteration contention from 16 concurrent CTAs (0/16 CTAs ever completed vs this
-// version's near-100% completion), so unsynchronized-but-idempotent access is intentional here.
+// Not thread-safe: callers must serialize per QP (drainSignals holds the per-peer drain_lock).
 NCCL_DEVICE_INLINE static int rqPollOne(struct doca_gpu_dev_verbs_qp* qp, struct ncclGinMrcRqState* state,
                                         uint32_t* imm, uint32_t* opcode) {
   if (state->status != 0) return state->status;
@@ -150,6 +174,11 @@ NCCL_DEVICE_INLINE static int rqPollOne(struct doca_gpu_dev_verbs_qp* qp, struct
             DOCA_GPUNETIO_VERBS_MLX5_CQE_OPCODE_SHIFT;
 
   state->consumer_index = ticket + 1;
+  if (state->post_mode == NCCL_GIN_MRC_RQ_POST_MODE_WQE) {
+    // Regular repost: rewrite the just-consumed slot's WQE and submit it.
+    rqPostRecv(qp, 1);
+    return 0;
+  }
   // Replenish the just-consumed immutable receive WQE by advancing only the RQ producer DBR.
   doca_gpu_dev_verbs_update_dbr<
     DOCA_GPUNETIO_VERBS_SYNC_SCOPE_GPU, DOCA_GPUNETIO_VERBS_GPU_CODE_OPT_DEFAULT,
