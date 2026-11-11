@@ -39,8 +39,11 @@ static ncclResult_t ncclGin_createContext(void* collComm, ncclGinConfig_v15_t* c
 }
 
 ncclGin_t* getNcclGin_v13(void* lib) {
-  ncclGin_v13 = (ncclGin_v13_t*)ncclOsDlsym(lib, "ncclGinPlugin_v13");
-  if (ncclGin_v13) {
+  // The compat wrappers dispatch through ncclGin_v13, and every GIN plugin library is probed with
+  // each version, so only latch it on a hit: a later probe of another library must not clear it.
+  ncclGin_v13_t* gin = (ncclGin_v13_t*)ncclOsDlsym(lib, "ncclGinPlugin_v13");
+  if (gin) {
+    ncclGin_v13 = gin;
     INFO(NCCL_INIT | NCCL_NET, "GIN/Plugin: Loaded gin plugin %s (v13)", ncclGin_v13->name);
     ncclGin.name = ncclGin_v13->name;
     ncclGin.init = ncclGin_v13->init;
