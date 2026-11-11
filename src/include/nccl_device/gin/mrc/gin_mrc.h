@@ -11,7 +11,13 @@
  *   - A counter is advanced locally by draining the send CQ: a put-with-counter
  *     records its counter id keyed by the last WQE index, and the drain bumps
  *     the counter once that WQE completes.
- *   - Only INDEXED signals are representable; VA signals and Get are unsupported.
+ *   - Only INDEXED signals are representable; VA signals are unsupported.
+ *   - Get uses Receiver-Driven Write (RDW): the requester writes a request descriptor
+ *     into the data owner's request ring with a Write-with-Immediate; the owner's
+ *     receive drain serves it with RDMA Writes back to the requester followed by a
+ *     Write-with-Immediate response on the same QP. Requests are only served while
+ *     the data owner runs a kernel that drives GIN progress (any signal/counter
+ *     read or wait, flush, or wait on a request).
  *
  * The GPU-resident context is created by the out-of-tree host plugin; its layout
  * is gin_mrc_dev.h.
@@ -46,6 +52,7 @@
 
 struct ncclGinMrcRequest {
   int peer;
+  uint32_t get_ticket; // low 32 bits of the peer's get_issued at flushAsync time
   uint64_t sq_rsvd_index;
 };
 static_assert(sizeof(ncclGinMrcRequest) <= sizeof(ncclGinRequest_t),
@@ -68,6 +75,63 @@ NCCL_DEVICE_INLINE static ncclGinMrcGPUContext* getCtx(ncclGinCtx ctx) {
 
 NCCL_DEVICE_INLINE static doca_gpu_dev_verbs_qp* getQp(ncclGinMrcGPUContext* mrc, int peer) {
   return (doca_gpu_dev_verbs_qp*)nccl::utility::loadConst(&mrc->qps) + peer;
+}
+
+/* ── RDW (Receiver-Driven Write) get protocol ────────────────────── */
+
+// Immediate layout. Signals carry a bare signal id (< kRdwFlag); RDW messages set kRdwFlag:
+//   [31] RDW  [30] response  [29:28] status (responses)  [27:22] generation  [21:0] request id
+static constexpr uint32_t kRdwFlag = 1u << 31;
+static constexpr uint32_t kRdwResp = 1u << 30;
+static constexpr uint32_t kRdwStatusShift = 28;
+static constexpr uint32_t kRdwGenShift = 22;
+static constexpr uint32_t kRdwGenMask = NCCL_GIN_MRC_RDW_GEN_MASK;
+static constexpr uint32_t kRdwIdMask = (1u << kRdwGenShift) - 1;
+
+enum : uint32_t {
+  kRdwStatusOk = 0,
+  kRdwStatusInvalid = 1,  // malformed descriptor or source outside a registered window
+  kRdwStatusBusy = 2,     // reserved: the server never answers BUSY yet
+  kRdwStatusRejected = 3, // descriptor does not match the request (stale generation or slot)
+};
+
+static constexpr uint32_t kRdwDescBytes = NCCL_GIN_MRC_RDW_DESC_BYTES;
+static constexpr uint32_t kRdwMaxSubs = 4;
+static constexpr uint32_t kRdwMaxSubBytes = 8u << 20;
+static constexpr uint32_t kRdwRespBytes = sizeof(uint64_t);
+
+struct ncclGinMrcGetSub {
+  uint32_t src_lo, src_hi; // offset in the server's window (zero-based MR)
+  uint32_t dst_lo, dst_hi; // offset in the requester's window (zero-based MR)
+  uint32_t len;
+  uint32_t src_key; // big-endian server rkey, translated to an lkey through the server's MR table
+  uint32_t dst_key; // big-endian requester rkey
+};
+struct ncclGinMrcGetDesc {
+  uint32_t tag;  // the request immediate, so a stale or overwritten slot is detectable
+  uint32_t nsub; // 1..kRdwMaxSubs
+  uint32_t reserved[2];
+  struct ncclGinMrcGetSub sub[kRdwMaxSubs];
+};
+static_assert(sizeof(ncclGinMrcGetDesc) == kRdwDescBytes, "RDW descriptor must be 128 B");
+
+NCCL_DEVICE_INLINE static uint32_t rdwRequestImm(uint32_t gen, uint64_t id) {
+  return kRdwFlag | ((gen & kRdwGenMask) << kRdwGenShift) | ((uint32_t)id & kRdwIdMask);
+}
+
+NCCL_DEVICE_INLINE static uint32_t rdwResponseImm(uint32_t requestImm, uint32_t status) {
+  return (requestImm & ~(3u << kRdwStatusShift)) | kRdwResp | (status << kRdwStatusShift);
+}
+
+// Byte offsets inside one context's region of the RDW MR (layout in gin_mrc_dev.h).
+NCCL_DEVICE_INLINE static uint64_t rdwRingOffset(uint32_t window, int requester, uint32_t slot) {
+  return ((uint64_t)requester * window + slot) * kRdwDescBytes;
+}
+NCCL_DEVICE_INLINE static uint64_t rdwStagingOffset(int nRanks, uint32_t window, int peer, uint32_t slot) {
+  return ((uint64_t)nRanks * window + (uint64_t)peer * window + slot) * kRdwDescBytes;
+}
+NCCL_DEVICE_INLINE static uint64_t rdwRespOffset(int nRanks, uint32_t window) {
+  return 2ull * nRanks * window * kRdwDescBytes;
 }
 
 /* ── Receive queue: one-time fill and non-blocking drain ──────────── */
@@ -109,6 +173,10 @@ NCCL_DEVICE_INLINE void rqInit(struct doca_gpu_dev_verbs_qp* qp, struct ncclGinM
   state->drain_lock = 0;
   state->post_mode = post_mode == NCCL_GIN_MRC_RQ_POST_MODE_WQE ? NCCL_GIN_MRC_RQ_POST_MODE_WQE
                                                                 : NCCL_GIN_MRC_RQ_POST_MODE_DBR;
+  state->get_issued = 0;
+  state->get_completed = 0;
+  state->get_status = 0;
+  state->get_lock = 0;
 
   // The slot table must be a power-of-two at least as large as the SQ ring so that every
   // outstanding WQE index maps to a unique slot; disable counters otherwise.
@@ -275,12 +343,135 @@ NCCL_DEVICE_INLINE static void sqDrainCounters(doca_gpu_dev_verbs_qp* qp, ncclGi
   }
 }
 
+/* ── RDW get: server and response handling (run by the receive drain) ── */
+
+// Translate a requester-supplied source rkey into the local lkey of the registered window that
+// owns it, checking that [off, off+len) lies inside that window. The host updates the table while
+// gets may be in flight (an entry is published by its rkey or by count, and removed entries are
+// tombstoned with rkey 0 / size 0), so read it through volatile to see each update.
+NCCL_DEVICE_INLINE static bool rdwLookupSource(ncclGinMrcMrTable* table, uint32_t key, uint64_t off, uint32_t len,
+                                               uint32_t* lkey) {
+  if (table == nullptr) return false;
+  volatile ncclGinMrcMrTable* t = table;
+  uint32_t n = t->count;
+  if (n > NCCL_GIN_MRC_MR_TABLE_CAPACITY) n = NCCL_GIN_MRC_MR_TABLE_CAPACITY;
+  for (uint32_t i = 0; i < n; i++) {
+    if (t->entries[i].rkey != key) continue;
+    const uint64_t size = t->entries[i].size;
+    if (off > size || len > size - off) return false;
+    *lkey = t->entries[i].lkey;
+    return true;
+  }
+  return false;
+}
+
+// Serve one get request that arrived from `requester` on its QP: copy the descriptor out of the
+// request ring, validate it, write each sub-request's data back, then answer with a
+// Write-with-Immediate carrying the request id, generation and status. MRC places the earlier
+// Writes on this QP before the response completes, so the requester sees the data once it
+// consumes the response. Caller holds the requester's drain lock.
+template <enum doca_gpu_dev_verbs_resource_sharing_mode resource_sharing_mode>
+NCCL_DEVICE_INLINE static void rdwServe(ncclGinCtx ctx, ncclGinMrcGPUContext* mrc, doca_gpu_dev_verbs_qp* qp,
+                                        int requester, uint32_t imm) {
+  using nccl::utility::loadConst;
+  const uint32_t window = loadConst(&mrc->rdw_window);
+  const uint32_t slot = imm & kRdwIdMask & (window - 1);
+  uint32_t* ring = (uint32_t*)(loadConst(&mrc->rdw_region) + rdwRingOffset(window, requester, slot));
+
+  // The NIC wrote the slot; read it at system scope so no stale L1 copy from an earlier request
+  // in the same slot is used.
+  ncclGinMrcGetDesc desc;
+  uint32_t* words = (uint32_t*)&desc;
+  for (uint32_t i = 0; i < kRdwDescBytes / sizeof(uint32_t); i++)
+    words[i] = doca_gpu_dev_verbs_load_relaxed_sys_global(ring + i);
+
+  uint32_t status = kRdwStatusOk;
+  uint32_t lkeys[kRdwMaxSubs];
+  if (desc.tag != imm) {
+    status = kRdwStatusRejected;
+  } else if (desc.nsub == 0 || desc.nsub > kRdwMaxSubs) {
+    status = kRdwStatusInvalid;
+  } else {
+    ncclGinMrcMrTable* table = loadConst(&mrc->mr_table);
+    for (uint32_t s = 0; s < desc.nsub; s++) {
+      const ncclGinMrcGetSub& sub = desc.sub[s];
+      const uint64_t srcOff = ((uint64_t)sub.src_hi << 32) | sub.src_lo;
+      if (sub.len == 0 || sub.len > kRdwMaxSubBytes ||
+          !rdwLookupSource(table, sub.src_key, srcOff, sub.len, &lkeys[s])) {
+        status = kRdwStatusInvalid;
+        break;
+      }
+    }
+  }
+
+  if (status == kRdwStatusOk) {
+    for (uint32_t s = 0; s < desc.nsub; s++) {
+      const ncclGinMrcGetSub& sub = desc.sub[s];
+      doca_gpu_dev_verbs_addr raddr, laddr;
+      raddr.addr = ((uint64_t)sub.dst_hi << 32) | sub.dst_lo;
+      raddr.key = sub.dst_key;
+      laddr.addr = ((uint64_t)sub.src_hi << 32) | sub.src_lo;
+      laddr.key = lkeys[s];
+      write<resource_sharing_mode>(qp, raddr, laddr, sub.len, /*useImm=*/false, 0, nullptr, 0);
+    }
+  }
+
+  // MRC rejects zero-length Write-with-Immediate: the response carries 8 scratch bytes into the
+  // requester's response landing slot.
+  doca_gpu_dev_verbs_addr raddr, laddr;
+  raddr.addr = loadConst(&mrc->rdw_ctx_offset) + rdwRespOffset(ctx.nRanks, window);
+  raddr.key = loadConst(loadConst(&mrc->rdw_rkeys) + requester);
+  laddr.addr = 0;
+  laddr.key = loadConst(&mrc->sink_lkey);
+  write<resource_sharing_mode>(qp, raddr, laddr, kRdwRespBytes, /*useImm=*/true, rdwResponseImm(imm, status), nullptr,
+                               0);
+}
+
+NCCL_DEVICE_INLINE static void rdwServeDispatch(ncclGinCtx ctx, ncclGinMrcGPUContext* mrc, doca_gpu_dev_verbs_qp* qp,
+                                                int requester, uint32_t imm) {
+  switch ((ncclGinResourceSharingMode)ctx.resourceSharingMode) {
+  case NCCL_GIN_RESOURCE_SHARING_THREAD:
+    rdwServe<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_EXCLUSIVE>(ctx, mrc, qp, requester, imm);
+    break;
+  case NCCL_GIN_RESOURCE_SHARING_CTA:
+    rdwServe<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_CTA>(ctx, mrc, qp, requester, imm);
+    break;
+  default:
+    rdwServe<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(ctx, mrc, qp, requester, imm);
+    break;
+  }
+}
+
+// Consume one get response from this peer. Responses of the current generation arrive in
+// request order; anything from another generation is stale and dropped. A non-OK status or an
+// out-of-order id is latched in get_status. Caller holds the peer's drain lock, so it is the
+// only writer of get_completed.
+NCCL_DEVICE_INLINE static void rdwComplete(ncclGinMrcGPUContext* mrc, ncclGinMrcRqState* state, uint32_t imm) {
+  const uint32_t gen = (imm >> kRdwGenShift) & kRdwGenMask;
+  if (gen != (nccl::utility::loadConst(&mrc->rdw_gen) & kRdwGenMask)) return;
+  cuda::atomic_ref<uint64_t, cuda::thread_scope_device> completed(state->get_completed);
+  const uint64_t done = completed.load(cuda::memory_order_relaxed);
+  const uint32_t status = (imm >> kRdwStatusShift) & 3u;
+  int32_t err = 0;
+  if ((imm & kRdwIdMask) != ((uint32_t)done & kRdwIdMask))
+    err = -EPROTO;
+  else if (status != kRdwStatusOk)
+    err = (int32_t)status;
+  if (err != 0) {
+    int32_t healthy = 0;
+    cuda::atomic_ref<int32_t, cuda::thread_scope_device>(state->get_status)
+      .compare_exchange_strong(healthy, err, cuda::memory_order_relaxed);
+  }
+  completed.store(done + 1, cuda::memory_order_release);
+}
+
 // Drain every peer's receive CQ once and apply the observed Write-with-Immediate signals to the
 // local indexed signal buffer, then advance any completed put-with-counter operations by
 // draining each peer's send CQ. Each receive completion bumps signals[signalId] by 1 (MRC
 // signals carry Inc semantics); each recorded, completed send WQE bumps counters[counterId] by
-// 1. Non-blocking: intended to be called from the signal/counter wait loops so a waiting thread
-// makes progress on its own context.
+// 1. RDW get requests from a peer are served here, and responses to this rank's own get
+// requests are consumed here. Non-blocking: intended to be called from the signal/counter wait
+// loops so a waiting thread makes progress on its own context.
 //
 // Many CTAs share one GIN context, so this is called concurrently. rqPollOne/sqDrainCounters
 // keep per-QP consumer indices that are NOT safe to advance from multiple threads at once (a
@@ -305,8 +496,15 @@ NCCL_DEVICE_INLINE static void drainSignals(ncclGinCtx ctx) {
       continue;
     uint32_t imm, opcode;
     while (rqPollOne(qp, state, &imm, &opcode) == 0) {
-      if (opcode == kCqeRespWriteImm)
+      if (opcode != kCqeRespWriteImm) continue;
+      if (imm & kRdwFlag) {
+        if (imm & kRdwResp)
+          rdwComplete(mrc, state, imm);
+        else
+          rdwServeDispatch(ctx, mrc, qp, peer, imm);
+      } else {
         cuda::atomic_ref<uint64_t, cuda::thread_scope_system>(signalBuf[imm]).fetch_add(1, cuda::memory_order_release);
+      }
     }
     sqDrainCounters(qp, state, counterBuf);
     drainLock.store(0, cuda::memory_order_release);
@@ -455,16 +653,161 @@ NCCL_DEVICE_INLINE static void putValueImpl(ncclGinCtx ctx, Coop coop, int peer,
   }
 }
 
+/* ── Get (RDW requester side) ─────────────────────────────────────── */
+
+// Post RDW requests for `bytes` from the peer's window (srcKey/srcOff) into the local window
+// (dstKey/dstOff): up to kRdwMaxSubs sub-requests of at most kRdwMaxSubBytes per request, each
+// request one 128 B Write-with-Immediate into the peer's request ring slot id % window. Posting
+// is serialized per peer under get_lock so request ids are issued in wire order; at most
+// `window` requests are in flight, and a full window is waited out by draining (which also
+// serves the peer's own requests to this rank, so two ranks fetching from each other cannot
+// starve one another).
+template <enum doca_gpu_dev_verbs_resource_sharing_mode resource_sharing_mode>
+NCCL_DEVICE_INLINE static void rdwPostGets(ncclGinCtx ctx, ncclGinMrcGPUContext* mrc, doca_gpu_dev_verbs_qp* qp,
+                                           int peer, uint32_t srcKey, uint64_t srcOff, uint32_t dstKey,
+                                           uint64_t dstOff, size_t bytes) {
+  using nccl::utility::loadConst;
+  ncclGinMrcRqState* state = loadConst(&mrc->rq) + peer;
+  const uint32_t window = loadConst(&mrc->rdw_window);
+  const uint32_t gen = loadConst(&mrc->rdw_gen);
+  uint8_t* region = loadConst(&mrc->rdw_region);
+  const uint64_t ctxOffset = loadConst(&mrc->rdw_ctx_offset);
+  const uint32_t peerRkey = loadConst(loadConst(&mrc->rdw_rkeys) + peer);
+  const uint32_t rdwLkey = loadConst(&mrc->rdw_lkey);
+
+  cuda::atomic_ref<int, cuda::thread_scope_device> lock(state->get_lock);
+  int unlocked = 0;
+  while (!lock.compare_exchange_weak(unlocked, 1, cuda::memory_order_acquire, cuda::memory_order_relaxed))
+    unlocked = 0;
+
+  cuda::atomic_ref<uint64_t, cuda::thread_scope_device> completed(state->get_completed);
+  cuda::atomic_ref<uint64_t, cuda::thread_scope_device> issued(state->get_issued);
+  uint64_t id = issued.load(cuda::memory_order_relaxed);
+  size_t done = 0;
+  while (done < bytes) {
+    NVCC_PRAGMA_UNROLL_DISABLED
+    while (id - completed.load(cuda::memory_order_acquire) >= window) drainSignals(ctx);
+
+    const uint32_t slot = (uint32_t)id & (window - 1);
+    ncclGinMrcGetDesc* desc = (ncclGinMrcGetDesc*)(region + rdwStagingOffset(ctx.nRanks, window, peer, slot));
+    uint32_t nsub = 0;
+    for (; nsub < kRdwMaxSubs && done < bytes; nsub++) {
+      const uint32_t len = (bytes - done) > kRdwMaxSubBytes ? kRdwMaxSubBytes : (uint32_t)(bytes - done);
+      const uint64_t s = srcOff + done;
+      const uint64_t d = dstOff + done;
+      desc->sub[nsub] = {(uint32_t)s, (uint32_t)(s >> 32), (uint32_t)d, (uint32_t)(d >> 32), len, srcKey, dstKey};
+      done += len;
+    }
+    const uint32_t tag = rdwRequestImm(gen, id);
+    desc->tag = tag;
+    desc->nsub = nsub;
+    // The NIC reads the descriptor from GPU memory once the doorbell rings.
+    __threadfence_system();
+
+    doca_gpu_dev_verbs_addr raddr, laddr;
+    raddr.addr = ctxOffset + rdwRingOffset(window, ctx.rank, slot);
+    raddr.key = peerRkey;
+    laddr.addr = ctxOffset + rdwStagingOffset(ctx.nRanks, window, peer, slot);
+    laddr.key = rdwLkey;
+    write<resource_sharing_mode>(qp, raddr, laddr, kRdwDescBytes, /*useImm=*/true, tag, nullptr, 0);
+    issued.store(++id, cuda::memory_order_release);
+  }
+  lock.store(0, cuda::memory_order_release);
+}
+
+template <enum doca_gpu_dev_verbs_resource_sharing_mode resource_sharing_mode, typename Coop>
+NCCL_DEVICE_INLINE static void getImplMode(ncclGinCtx ctx, Coop coop, int peer, ncclGinWindow_t remoteWin,
+                                           size_t remoteOff, ncclGinWindow_t localWin, size_t localOff, size_t bytes) {
+  using nccl::utility::loadConst;
+  coop.sync();
+  if (coop.thread_rank() == 0 && bytes > 0) {
+    ncclGinMrcGPUContext* mrc = getCtx(ctx);
+    doca_gpu_dev_verbs_qp* qp = getQp(mrc, peer);
+    ncclGinMrcMemHandle* remoteMh = (ncclGinMrcMemHandle*)remoteWin;
+    ncclGinMrcMemHandle* localMh = (ncclGinMrcMemHandle*)localWin;
+    const uint32_t dstKey = loadConst(loadConst(&localMh->rkeys) + ctx.rank);
+    if (peer == ctx.rank) {
+      // Loopback: the self QP is connected to a local responder, so a plain Write from the
+      // source window into the destination window is the get. The send CQ covers completion.
+      doca_gpu_dev_verbs_addr raddr, laddr;
+      raddr.addr = localOff;
+      raddr.key = dstKey;
+      laddr.addr = remoteOff;
+      laddr.key = loadConst(&remoteMh->lkey);
+      write<resource_sharing_mode>(qp, raddr, laddr, bytes, /*useImm=*/false, 0, nullptr, 0);
+    } else {
+      rdwPostGets<resource_sharing_mode>(ctx, mrc, qp, peer, loadConst(loadConst(&remoteMh->rkeys) + peer),
+                                         remoteOff, dstKey, localOff, bytes);
+    }
+  }
+  coop.sync();
+}
+
+template <typename Coop>
+NCCL_DEVICE_INLINE static void getImpl(ncclGinCtx ctx, Coop coop, int peer, ncclGinWindow_t remoteWin,
+                                       size_t remoteOff, ncclGinWindow_t localWin, size_t localOff, size_t bytes) {
+  switch ((ncclGinResourceSharingMode)ctx.resourceSharingMode) {
+  case NCCL_GIN_RESOURCE_SHARING_THREAD:
+    getImplMode<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_EXCLUSIVE>(ctx, coop, peer, remoteWin, remoteOff, localWin,
+                                                                     localOff, bytes);
+    break;
+  case NCCL_GIN_RESOURCE_SHARING_CTA:
+    getImplMode<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_CTA>(ctx, coop, peer, remoteWin, remoteOff, localWin,
+                                                               localOff, bytes);
+    break;
+  default:
+    getImplMode<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(ctx, coop, peer, remoteWin, remoteOff, localWin,
+                                                               localOff, bytes);
+    break;
+  }
+}
+
+// Wait until every get to this peer issued before `ticket` (low 32 bits of get_issued) has been
+// answered, draining while spinning. Returns ncclRemoteError if any answer was not OK.
+template <bool HasTimeout>
+NCCL_DEVICE_INLINE static ncclResult_t rdwWaitGets(ncclGinCtx ctx, ncclGinMrcRqState* state, uint32_t ticket,
+                                                   uint32_t* abortFlag, uint64_t startCycle, uint64_t timeoutCycles,
+                                                   uint32_t& steps) {
+  (void)startCycle;
+  (void)timeoutCycles;
+  cuda::atomic_ref<uint64_t, cuda::thread_scope_device> completed(state->get_completed);
+  NVCC_PRAGMA_UNROLL_DISABLED
+  while ((int32_t)((uint32_t)completed.load(cuda::memory_order_acquire) - ticket) < 0) {
+    drainSignals(ctx);
+    if NCCL_IF_CONSTEXPR (HasTimeout) {
+      if (clock64() - startCycle >= timeoutCycles) return ncclTimeout;
+    }
+    if (nccl::utility::testAbort(abortFlag, steps)) return ncclSuccess;
+  }
+  return cuda::atomic_ref<int32_t, cuda::thread_scope_device>(state->get_status).load(cuda::memory_order_relaxed)
+           ? ncclRemoteError
+           : ncclSuccess;
+}
+
+// The void flush/wait variants have no way to return an error, and the fetched data cannot be
+// trusted, so fail loudly.
+NCCL_DEVICE_INLINE static void rdwFailGets(ncclGinCtx ctx) {
+  printf("NCCL GIN/MRC: rank %d context %d: get failed (RDW error response); see ncclGinMrcRqState::get_status\n",
+         ctx.rank, ctx.contextId);
+  __trap();
+}
+
 /* ── Completion: flush / wait ─────────────────────────────────────── */
 
-// MRC has no Get, so there is never read data to settle: the flush watermark is simply the
-// current reservation index on the peer's QP.
+// The flush watermark is the current reservation index on the peer's QP, plus, for gets, the
+// number of RDW requests issued to the peer: get data is only visible once their responses have
+// been consumed.
 template <enum doca_gpu_dev_verbs_resource_sharing_mode doca_sharing_mode>
 NCCL_DEVICE_INLINE static void flushAsyncImpl(ncclGinCtx ctx, int peer, ncclGinRequest_t* outRequest) {
   ncclGinMrcRequest* req = reinterpret_cast<ncclGinMrcRequest*>(outRequest);
+  ncclGinMrcGPUContext* mrc = getCtx(ctx);
   req->peer = peer;
-  doca_gpu_dev_verbs_qp* qp = getQp(getCtx(ctx), peer);
+  doca_gpu_dev_verbs_qp* qp = getQp(mrc, peer);
   req->sq_rsvd_index = doca_gpu_dev_verbs_atomic_read<uint64_t, doca_sharing_mode>(&qp->sq_rsvd_index);
+  ncclGinMrcRqState* rq = nccl::utility::loadConst(&mrc->rq);
+  req->get_ticket = rq ? (uint32_t)cuda::atomic_ref<uint64_t, cuda::thread_scope_device>(rq[peer].get_issued)
+                           .load(cuda::memory_order_acquire)
+                       : 0;
 }
 
 template <bool HasTimeout, enum doca_gpu_dev_verbs_resource_sharing_mode doca_sharing_mode>
@@ -473,46 +816,54 @@ NCCL_DEVICE_INLINE static ncclResult_t waitImplCore(ncclGinCtx ctx, ncclGinReque
   using nccl::utility::testAbort;
   (void)timeoutCycles; // referenced only when HasTimeout is true
   ncclGinMrcRequest& req = reinterpret_cast<ncclGinMrcRequest&>(request);
-  doca_gpu_dev_verbs_qp* qp = getQp(getCtx(ctx), req.peer);
-  if (req.sq_rsvd_index == 0) return ncclSuccess;
-  const doca_gpu_dev_verbs_ticket_t pollIdx = static_cast<doca_gpu_dev_verbs_ticket_t>(req.sq_rsvd_index - 1u);
-
-  // doca_gpu_dev_verbs_wait blocks indefinitely, so it can only be used when the caller has no
-  // deadline AND no abort flag to honor.
-  if NCCL_IF_CONSTEXPR (!HasTimeout) {
-    if (abortFlag == nullptr) {
-      doca_gpu_dev_verbs_ticket_t waitIdx = pollIdx;
-      doca_gpu_dev_verbs_wait<doca_sharing_mode>(qp, &waitIdx);
-      cuda::atomic_thread_fence(ord, cuda::thread_scope_system);
-      return ncclSuccess;
-    }
-  }
-
+  ncclGinMrcGPUContext* mrc = getCtx(ctx);
+  doca_gpu_dev_verbs_qp* qp = getQp(mrc, req.peer);
   uint32_t steps = 0;
   uint64_t startCycle = 0;
   (void)startCycle; // referenced only when HasTimeout is true
   if NCCL_IF_CONSTEXPR (HasTimeout) startCycle = clock64();
-  NVCC_PRAGMA_UNROLL_DISABLED
-  while (true) {
-    int status = doca_gpu_dev_verbs_poll_one_cq_at<doca_sharing_mode>(doca_gpu_dev_verbs_qp_get_cq_sq(qp), pollIdx);
-    if (status == 0) {
-      cuda::atomic_thread_fence(ord, cuda::thread_scope_system);
-      return ncclSuccess;
+
+  if (req.sq_rsvd_index != 0) {
+    const doca_gpu_dev_verbs_ticket_t pollIdx = static_cast<doca_gpu_dev_verbs_ticket_t>(req.sq_rsvd_index - 1u);
+    bool done = false;
+    // doca_gpu_dev_verbs_wait blocks indefinitely, so it can only be used when the caller has no
+    // deadline AND no abort flag to honor.
+    if NCCL_IF_CONSTEXPR (!HasTimeout) {
+      if (abortFlag == nullptr) {
+        doca_gpu_dev_verbs_ticket_t waitIdx = pollIdx;
+        doca_gpu_dev_verbs_wait<doca_sharing_mode>(qp, &waitIdx);
+        done = true;
+      }
     }
-    if NCCL_IF_CONSTEXPR (HasTimeout) {
-      if (clock64() - startCycle >= timeoutCycles) return ncclTimeout;
-    }
-    if (testAbort(abortFlag, steps)) {
-      cuda::atomic_thread_fence(ord, cuda::thread_scope_system);
-      return ncclSuccess;
+    NVCC_PRAGMA_UNROLL_DISABLED
+    while (!done) {
+      int status = doca_gpu_dev_verbs_poll_one_cq_at<doca_sharing_mode>(doca_gpu_dev_verbs_qp_get_cq_sq(qp), pollIdx);
+      if (status == 0) break;
+      if NCCL_IF_CONSTEXPR (HasTimeout) {
+        if (clock64() - startCycle >= timeoutCycles) return ncclTimeout;
+      }
+      if (testAbort(abortFlag, steps)) {
+        cuda::atomic_thread_fence(ord, cuda::thread_scope_system);
+        return ncclSuccess;
+      }
     }
   }
+
+  ncclGinMrcRqState* rq = nccl::utility::loadConst(&mrc->rq);
+  if (rq != nullptr && req.peer != ctx.rank) {
+    ncclResult_t ret =
+      rdwWaitGets<HasTimeout>(ctx, rq + req.peer, req.get_ticket, abortFlag, startCycle, timeoutCycles, steps);
+    if (ret != ncclSuccess) return ret;
+  }
+  cuda::atomic_thread_fence(ord, cuda::thread_scope_system);
+  return ncclSuccess;
 }
 
 template <enum doca_gpu_dev_verbs_resource_sharing_mode doca_sharing_mode>
 NCCL_DEVICE_INLINE static void waitImpl(ncclGinCtx ctx, ncclGinRequest_t& request, cuda::memory_order ord,
                                         uint32_t* abortFlag) {
-  (void)waitImplCore</*HasTimeout=*/false, doca_sharing_mode>(ctx, request, ord, abortFlag, 0);
+  if (waitImplCore</*HasTimeout=*/false, doca_sharing_mode>(ctx, request, ord, abortFlag, 0) == ncclRemoteError)
+    rdwFailGets(ctx);
 }
 
 template <enum doca_gpu_dev_verbs_resource_sharing_mode doca_sharing_mode>
@@ -530,6 +881,7 @@ NCCL_DEVICE_INLINE static ncclResult_t flushImplModeCore(ncclGinCtx ctx, Coop co
 
   ncclGinMrcGPUContext* mrc = getCtx(ctx);
   doca_gpu_dev_verbs_qp* qps = (doca_gpu_dev_verbs_qp*)loadConst(&mrc->qps);
+  ncclGinMrcRqState* rq = loadConst(&mrc->rq);
   uint32_t steps = 0;
   uint64_t startCycle = 0;
   (void)startCycle; // referenced only when HasTimeout is true
@@ -538,19 +890,20 @@ NCCL_DEVICE_INLINE static ncclResult_t flushImplModeCore(ncclGinCtx ctx, Coop co
   NVCC_PRAGMA_UNROLL_DISABLED
   for (int peer = coop.thread_rank(); peer < ctx.nRanks; peer += coop.size()) {
     uint64_t ticket = doca_gpu_dev_verbs_atomic_read<uint64_t, resource_sharing_mode>(&qps[peer].sq_rsvd_index);
-    if (ticket == 0) continue; // No need to poll if there are no outstanding operations
-    --ticket;
+    // No need to poll the send CQ if there are no outstanding operations.
+    bool done = ticket == 0;
+    if (!done) --ticket;
 
     if NCCL_IF_CONSTEXPR (!HasTimeout) {
-      if (abortFlag == nullptr) {
+      if (!done && abortFlag == nullptr) {
         doca_gpu_dev_verbs_ticket_t waitIdx = ticket;
         doca_gpu_dev_verbs_wait<resource_sharing_mode>(&qps[peer], &waitIdx);
-        continue;
+        done = true;
       }
     }
 
     NVCC_PRAGMA_UNROLL_DISABLED
-    while (true) {
+    while (!done) {
       int status =
         doca_gpu_dev_verbs_poll_one_cq_at<resource_sharing_mode>(doca_gpu_dev_verbs_qp_get_cq_sq(&qps[peer]), ticket);
       if (status == 0) break;
@@ -562,6 +915,19 @@ NCCL_DEVICE_INLINE static ncclResult_t flushImplModeCore(ncclGinCtx ctx, Coop co
           cuda::atomic_thread_fence(ord, cuda::thread_scope_system);
           return ncclSuccess;
         } else break; // Non-timeout path advances to the next peer on abort.
+      }
+    }
+
+    // Gets from this peer are only locally visible once their RDW responses are consumed.
+    // Loopback gets are plain Writes covered by the send-CQ wait above.
+    if (rq != nullptr && peer != ctx.rank) {
+      const uint32_t issued = (uint32_t)cuda::atomic_ref<uint64_t, cuda::thread_scope_device>(rq[peer].get_issued)
+                                .load(cuda::memory_order_acquire);
+      ncclResult_t ret = rdwWaitGets<HasTimeout>(ctx, rq + peer, issued, abortFlag, startCycle, timeoutCycles, steps);
+      if (ret == ncclTimeout) return ret;
+      if (ret == ncclRemoteError) {
+        if NCCL_IF_CONSTEXPR (HasTimeout) return ret;
+        else rdwFailGets(ctx);
       }
     }
   }
@@ -622,6 +988,7 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_MRC> {
     assert(signal.type != NCCL_GIN_SIGNAL_TYPE_VA && "MRC GIN: VA signals are not supported");
     bool hasSignal = signal.type == NCCL_GIN_SIGNAL_TYPE_INDEXED;
     uint32_t signalId = hasSignal ? (uint32_t)signal.indexedSignal.signalId : 0;
+    assert((signalId & nccl::gin::mrc::kRdwFlag) == 0 && "MRC GIN: signal id collides with the RDW immediate tag");
     nccl::gin::mrc::putImpl(ctx, coop, peer, hasWins, dstWin, dstOff, srcWin, srcOff, bytes, hasSignal, signalId,
                             hasCounter, (uint32_t)counterId, required, given, optFlags);
   }
@@ -642,21 +1009,21 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_MRC> {
     assert(signal.type != NCCL_GIN_SIGNAL_TYPE_VA && "MRC GIN: VA signals are not supported");
     bool hasSignal = signal.type == NCCL_GIN_SIGNAL_TYPE_INDEXED;
     uint32_t signalId = hasSignal ? (uint32_t)signal.indexedSignal.signalId : 0;
+    assert((signalId & nccl::gin::mrc::kRdwFlag) == 0 && "MRC GIN: signal id collides with the RDW immediate tag");
     nccl::gin::mrc::putValueImpl(ctx, coop, peer, dstWin, dstOff, srcVal, hasSignal, signalId, required, given,
                                  optFlags);
   }
 };
 
-// MRC QPs have no remote-read verb.
+// MRC QPs have no remote-read verb: gets are served by the peer via Receiver-Driven Write.
 template <>
 struct ncclGinApi_Get<NCCL_NET_DEVICE_GIN_MRC> {
   template <typename Coop>
   NCCL_DEVICE_INLINE static void call(ncclGinCtx ctx, Coop coop, int peer, ncclGinWindow_t remoteWin, size_t remoteOff,
                                       ncclGinWindow_t localWin, size_t localOff, size_t bytes, bool hasDescriptor,
                                       ncclGinDescriptorSmem* descriptor, uint32_t optFlags = ncclGinOptFlagsDefault) {
-    (void)ctx, (void)coop, (void)peer, (void)remoteWin, (void)remoteOff, (void)localWin, (void)localOff, (void)bytes,
-      (void)hasDescriptor, (void)descriptor, (void)optFlags;
-    assert(false && "MRC GIN: Get is not supported");
+    (void)hasDescriptor, (void)descriptor, (void)optFlags;
+    nccl::gin::mrc::getImpl(ctx, coop, peer, remoteWin, remoteOff, localWin, localOff, bytes);
   }
 };
 

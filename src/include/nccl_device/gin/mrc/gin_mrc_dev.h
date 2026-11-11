@@ -49,6 +49,30 @@ struct ncclGinMrcRqState {
   // consumer_index regresses it and silently drops signal increments.
   int drain_lock;
   uint32_t post_mode; // NCCL_GIN_MRC_RQ_POST_MODE_*
+  // Requester-side RDW get state for this peer (see ncclGinMrcGPUContext::rdw_*). Request ids
+  // are allocated under get_lock in wire order, and the peer serves and answers them in that
+  // order, so get_completed is a monotonic count of answered requests.
+  uint64_t get_issued;    // requests posted to this peer
+  uint64_t get_completed; // responses consumed (advanced by the receive drain)
+  int32_t get_status;     // latched first non-OK response status / protocol error (0 = healthy)
+  int get_lock;           // serializes request posting to this peer (0=free, 1=held)
+};
+
+// Registered windows of this rank, used by the RDW server to validate a get request's source
+// key and bounds and to translate the requester-supplied rkey into the local lkey.
+#define NCCL_GIN_MRC_MR_TABLE_CAPACITY 1024
+// RDW get wire constants shared with the host plugin (which sizes the RDW buffer).
+#define NCCL_GIN_MRC_RDW_DESC_BYTES 128 // request descriptor and request-ring slot size
+#define NCCL_GIN_MRC_RDW_GEN_MASK 0x3Fu // generation bits carried in the immediate
+struct ncclGinMrcMrEntry {
+  uint32_t rkey; // big-endian
+  uint32_t lkey; // big-endian
+  uint64_t size; // registered bytes (MRs are zero-based, so offsets must stay below this)
+};
+struct ncclGinMrcMrTable {
+  uint32_t count;
+  uint32_t reserved;
+  struct ncclGinMrcMrEntry entries[NCCL_GIN_MRC_MR_TABLE_CAPACITY];
 };
 
 struct ncclGinMrcGPUContext {
@@ -66,6 +90,23 @@ struct ncclGinMrcGPUContext {
   uint32_t signals_sink_offset;
 
   uint32_t sink_lkey; // big-endian lkey of a local scratch buffer we write from but never read
+
+  // Receiver-Driven Write (RDW) get. MRC has no RDMA Read, so a get is a request descriptor
+  // sent by Write-with-Immediate into the data owner's request ring; the owner's receive drain
+  // serves it with RDMA Writes plus a Write-with-Immediate response on the same QP.
+  //
+  // RDW MR layout, one region per context (identical on every rank):
+  //   [0, R)        request ring  [nRanks requester][rdw_window] x 128 B (written by peers)
+  //   [R, 2R)       staging       [nRanks peer][rdw_window] x 128 B (local descriptors)
+  //   [2R, 2R+128)  response landing for the 8 B response payload
+  // where R = nRanks * rdw_window * 128.
+  struct ncclGinMrcMrTable* mr_table; // this rank's registered windows
+  uint8_t* rdw_region;     // device pointer to this context's region of the local RDW MR
+  uint32_t* rdw_rkeys;     // [nRanks] big-endian rkeys of the peers' RDW MRs
+  uint64_t rdw_ctx_offset; // offset of this context's region within the (zero-based) RDW MR
+  uint32_t rdw_lkey;       // big-endian
+  uint32_t rdw_window;     // in-flight requests per peer (power of two)
+  uint32_t rdw_gen;        // generation tag carried by requests and echoed in responses
 };
 
 struct ncclGinMrcMemHandle {
