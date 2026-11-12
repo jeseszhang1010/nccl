@@ -56,6 +56,10 @@ struct ncclGinMrcRqState {
   uint64_t get_completed; // responses consumed (advanced by the receive drain)
   int32_t get_status;     // latched first non-OK response status / protocol error (0 = healthy)
   int get_lock;           // serializes request posting to this peer (0=free, 1=held)
+  // Partially received multi-chunk ncclGin_SignalAdd from this peer (see encodeSignal in
+  // gin_mrc.h). Only the drain-lock holder touches these.
+  uint64_t add_acc;   // sum of the chunks received so far
+  uint32_t add_shift; // bit position of the next chunk
 };
 
 // Registered windows of this rank, used by the RDW server to validate a get request's source
