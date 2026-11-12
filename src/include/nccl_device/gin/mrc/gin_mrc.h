@@ -272,8 +272,8 @@ NCCL_DEVICE_INLINE static void recordCounter(ncclGinMrcRqState* state, uint64_t 
 }
 
 // Posts a (possibly chunked) RDMA Write; when useImm is set the last chunk is an RDMA
-// Write-with-Immediate carrying signalId (bytes == 0 posts a single zero-length
-// Write-with-Immediate, i.e. a bare signal). When counterState is non-null the last WQE index
+// Write-with-Immediate carrying signalId. bytes must be non-zero: MRC rejects zero-length
+// Write-with-Immediate, so callers send bare signals through the sink scratch instead. When counterState is non-null the last WQE index
 // is recorded for send-CQ counter draining before the doorbell rings. Must be called by a
 // single thread; the QP uses a GPU-SM doorbell so the submit rings the NIC directly.
 // Returns the last reserved WQE index.
@@ -514,7 +514,9 @@ NCCL_DEVICE_INLINE static void drainSignals(ncclGinCtx ctx) {
 /* ── Put / PutValue ───────────────────────────────────────────────── */
 
 // Data-only puts use a plain RDMA Write; a put carrying a signal, or a bare signal, is
-// delivered via Write-with-Immediate encoding the signal id.
+// delivered via Write-with-Immediate encoding the signal id. A zero-byte put is sent like a bare
+// signal (MRC rejects a zero-length Write-with-Immediate), and is a no-op when it carries neither
+// a signal nor a counter.
 template <enum doca_gpu_dev_verbs_resource_sharing_mode resource_sharing_mode, typename Coop>
 NCCL_DEVICE_INLINE static void putImplMode(ncclGinCtx ctx, Coop coop, int peer, bool hasWins,
                                            ncclGinWindow_t dstWin, size_t dstOff, ncclGinWindow_t srcWin, size_t srcOff,
@@ -536,7 +538,7 @@ NCCL_DEVICE_INLINE static void putImplMode(ncclGinCtx ctx, Coop coop, int peer, 
       doca_gpu_dev_verbs_fence_release<DOCA_GPUNETIO_VERBS_SYNC_SCOPE_SYS>();
     }
 
-    if (hasWins) {
+    if (hasWins && bytes > 0) {
       doca_gpu_dev_verbs_addr raddr, laddr;
       raddr.addr = dstOff;
       raddr.key = loadConst(loadConst(&dstMh->rkeys) + peer);
@@ -544,18 +546,19 @@ NCCL_DEVICE_INLINE static void putImplMode(ncclGinCtx ctx, Coop coop, int peer, 
       laddr.key = loadConst(&srcMh->lkey);
       // Data write: carry the signal as an immediate when requested, otherwise a plain write.
       write<resource_sharing_mode>(qp, raddr, laddr, bytes, /*useImm=*/hasSignal, signalId, counterState, counterId);
-    } else if (hasSignal) {
-      // Bare signal: the immediate carries the signalId; the receiver's drain increments its
-      // LOCAL signal counter from the CQE. Transfer the registered sink scratch because MRC does
-      // not accept a zero-length Write-with-Immediate. The payload must land in the reserved sink
-      // slot, never in the signal slot, which the receiver's drain owns.
+    } else if (hasSignal || hasCounter) {
+      // Bare signal or zero-byte put: the immediate carries the signalId; the receiver's drain
+      // increments its LOCAL signal counter from the CQE. Transfer the registered sink scratch
+      // because MRC does not accept a zero-length Write-with-Immediate. The payload must land in
+      // the reserved sink slot, never in the signal slot, which the receiver's drain owns. A
+      // counter-only zero-byte put sends the same scratch write without an immediate.
       doca_gpu_dev_verbs_addr sig_raddr, sig_laddr;
       sig_raddr.addr = sizeof(uint64_t) * loadConst(&mrc->signals_sink_offset);
       sig_raddr.key = loadConst(loadConst(&mrc->signal_rkeys) + peer);
       sig_laddr.addr = 0;
       sig_laddr.key = loadConst(&mrc->sink_lkey);
-      uint64_t sigWqeIdx = write<resource_sharing_mode>(qp, sig_raddr, sig_laddr, sizeof(uint64_t), /*useImm=*/true,
-                                                        signalId, counterState, counterId);
+      uint64_t sigWqeIdx = write<resource_sharing_mode>(qp, sig_raddr, sig_laddr, sizeof(uint64_t),
+                                                        /*useImm=*/hasSignal, signalId, counterState, counterId);
       // Confirm the local send completed before this thread (possibly the last one touching this
       // QP this round) moves on; bare signals otherwise have nothing else that consumes their SQ
       // CQE, so wait on this specific ticket rather than relying on a later reservation to
