@@ -25,7 +25,7 @@ const int gdakiBackendMinVersions[] = {0, NCCL_VERSION(2, 30, 3), NCCL_VERSION(2
 const int gpiBackendMinVersions[] = {0, NCCL_VERSION(2, 30, 5)};
 constexpr int efaGdaBackendMinVersions[] = {0, NCCL_VERSION(2, 31, 0), NCCL_VERSION(2, 32, 0)};
 const int mrcBackendMinVersions[] = {0, NCCL_VERSION(2, 31, 2), NCCL_VERSION(2, 31, 2), NCCL_VERSION(2, 31, 2),
-                                     NCCL_VERSION(2, 32, 6), NCCL_VERSION(2, 32, 6)};
+                                     NCCL_VERSION(2, 32, 6), NCCL_VERSION(2, 32, 6), NCCL_VERSION(2, 32, 6)};
 
 ncclResult_t ncclGetGinType(struct ncclComm* comm, ncclGinType_t* ginType) {
   if (comm == nullptr || ginType == nullptr) return ncclInternalError;

@@ -574,14 +574,57 @@ NCCL_DEVICE_INLINE static void rdwComplete(ncclGinMrcGPUContext* mrc, ncclGinMrc
   completed.store(done + 1, cuda::memory_order_release);
 }
 
+// Data Direct flush (see ncclGinMrcGPUContext::dd_flush): a DUMP WQE reads the Data Direct
+// registered flush buffer over the same PCIe link the NIC placed received data on, so once it
+// completes every write that preceded the completions consumed before it is visible. It is posted
+// on the loopback responder, whose send queue carries no other traffic, so it never waits behind
+// puts stalled on a peer that is itself blocked in this flush.
+NCCL_DEVICE_INLINE static void ddFlush(ncclGinMrcGPUContext* mrc) {
+  using nccl::utility::loadConst;
+  constexpr auto kMode = DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU;
+  doca_gpu_dev_verbs_qp* fq = (doca_gpu_dev_verbs_qp*)loadConst(&mrc->self_rq_qp);
+  const uint64_t wqe_idx = doca_gpu_dev_verbs_reserve_wq_slots<kMode>(fq, 1);
+  doca_gpu_dev_verbs_wqe_prepare_dump(fq, doca_gpu_dev_verbs_get_wqe_ptr(fq, wqe_idx), wqe_idx,
+                                      DOCA_GPUNETIO_MLX5_WQE_CTRL_CQ_UPDATE, 0, loadConst(&mrc->dd_flush_lkey), 1);
+  doca_gpu_dev_verbs_mark_wqes_ready<kMode>(fq, wqe_idx, wqe_idx);
+  doca_gpu_dev_verbs_submit<kMode, DOCA_GPUNETIO_VERBS_SYNC_SCOPE_GPU, DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_DB>(
+    fq, wqe_idx + 1);
+  doca_gpu_dev_verbs_ticket_t ticket = static_cast<doca_gpu_dev_verbs_ticket_t>(wqe_idx);
+  doca_gpu_dev_verbs_wait<kMode>(fq, &ticket);
+}
+
+// Apply one received Write-with-Immediate (other than an RDW request).
+NCCL_DEVICE_INLINE static void applyImm(ncclGinMrcGPUContext* mrc, ncclGinMrcRqState* state, uint64_t* signalBuf,
+                                        uint32_t imm) {
+  if (imm & kRdwFlag) {
+    rdwComplete(mrc, state, imm);
+  } else if (imm & kSigAddFlag) {
+    // Chunks of one Add arrive back to back on this QP, and the drain lock makes this the only
+    // thread touching add_acc/add_shift, even across drain rounds.
+    state->add_acc += (uint64_t)(imm & kSigAddChunkMask) << state->add_shift;
+    if (imm & kSigAddMore) {
+      state->add_shift += kSigAddChunkBits;
+    } else {
+      const uint32_t signalId = (imm >> kSigAddChunkBits) & kSigAddIdMask;
+      cuda::atomic_ref<uint64_t, cuda::thread_scope_system>(signalBuf[signalId])
+        .fetch_add(state->add_acc, cuda::memory_order_release);
+      state->add_acc = 0;
+      state->add_shift = 0;
+    }
+  } else {
+    cuda::atomic_ref<uint64_t, cuda::thread_scope_system>(signalBuf[imm]).fetch_add(1, cuda::memory_order_release);
+  }
+}
+
 // Drain every peer's receive CQ once and apply the observed Write-with-Immediate signals to the
 // local indexed signal buffer, then advance any completed put-with-counter operations by
 // draining each peer's send CQ. Each Inc completion bumps signals[signalId] by 1; Add chunks are
 // accumulated in the peer's drain state and the sum is applied on the last chunk (see
 // encodeSignal). Each recorded, completed send WQE bumps counters[counterId] by 1. RDW get
 // requests from a peer are served here, and responses to this rank's own get
-// requests are consumed here. Non-blocking: intended to be called from the signal/counter wait
-// loops so a waiting thread makes progress on its own context.
+// requests are consumed here. With Data Direct, completions that carry data are applied only after
+// a ddFlush. Non-blocking apart from that flush: intended to be called from the signal/counter
+// wait loops so a waiting thread makes progress on its own context.
 //
 // Many CTAs share one GIN context, so this is called concurrently. rqPollOne/sqDrainCounters
 // keep per-QP consumer indices that are NOT safe to advance from multiple threads at once (a
@@ -592,11 +635,13 @@ NCCL_DEVICE_INLINE static void rdwComplete(ncclGinMrcGPUContext* mrc, ncclGinMrc
 // this from its spin loop, so no signal is missed and no thread starves.
 NCCL_DEVICE_INLINE static void drainSignals(ncclGinCtx ctx) {
   using nccl::utility::loadConst;
+  constexpr int kDrainBatch = 32;
   ncclGinMrcGPUContext* mrc = getCtx(ctx);
   ncclGinMrcRqState* rq = loadConst(&mrc->rq);
   if (rq == nullptr) return;
   uint64_t* signalBuf = loadConst(&mrc->signals);
   uint64_t* counterBuf = loadConst(&mrc->counters);
+  const bool ddFlushOn = loadConst(&mrc->dd_flush) != 0;
   for (int peer = 0; peer < ctx.nRanks; peer++) {
     doca_gpu_dev_verbs_qp* qp = getQp(mrc, peer);
     doca_gpu_dev_verbs_qp* rqQp = getRqQp(mrc, peer, ctx.rank);
@@ -605,30 +650,25 @@ NCCL_DEVICE_INLINE static void drainSignals(ncclGinCtx ctx) {
     int unlocked = 0;
     if (!drainLock.compare_exchange_strong(unlocked, 1, cuda::memory_order_acquire, cuda::memory_order_relaxed))
       continue;
-    uint32_t imm, opcode;
-    while (rqPollOne(rqQp, state, &imm, &opcode) == 0) {
-      if (opcode != kCqeRespWriteImm) continue;
-      if (imm & kRdwFlag) {
-        if (imm & kRdwResp)
-          rdwComplete(mrc, state, imm);
-        else
+    bool more = true;
+    while (more) {
+      // Collect a batch so one Data Direct flush covers all of it; requests are served at once
+      // since their descriptors are not written over Data Direct.
+      uint32_t batch[kDrainBatch];
+      int n = 0;
+      uint32_t imm, opcode;
+      more = false;
+      while (n < kDrainBatch) {
+        if (rqPollOne(rqQp, state, &imm, &opcode) != 0) break;
+        if (opcode != kCqeRespWriteImm) continue;
+        if ((imm & kRdwFlag) && !(imm & kRdwResp))
           rdwServeDispatch(ctx, mrc, qp, peer, imm);
-      } else if (imm & kSigAddFlag) {
-        // Chunks of one Add arrive back to back on this QP, and the drain lock makes this the
-        // only thread touching add_acc/add_shift, even across drain rounds.
-        state->add_acc += (uint64_t)(imm & kSigAddChunkMask) << state->add_shift;
-        if (imm & kSigAddMore) {
-          state->add_shift += kSigAddChunkBits;
-        } else {
-          const uint32_t signalId = (imm >> kSigAddChunkBits) & kSigAddIdMask;
-          cuda::atomic_ref<uint64_t, cuda::thread_scope_system>(signalBuf[signalId])
-            .fetch_add(state->add_acc, cuda::memory_order_release);
-          state->add_acc = 0;
-          state->add_shift = 0;
-        }
-      } else {
-        cuda::atomic_ref<uint64_t, cuda::thread_scope_system>(signalBuf[imm]).fetch_add(1, cuda::memory_order_release);
+        else
+          batch[n++] = imm;
       }
+      if (n == kDrainBatch) more = true;
+      if (n > 0 && ddFlushOn) ddFlush(mrc);
+      for (int i = 0; i < n; i++) applyImm(mrc, state, signalBuf, batch[i]);
     }
     sqDrainCounters(qp, state, counterBuf);
     drainLock.store(0, cuda::memory_order_release);

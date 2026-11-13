@@ -115,8 +115,15 @@ struct ncclGinMrcGPUContext {
   // An MRC QP cannot target itself, so qps[rank] is connected to a dedicated loopback responder
   // QP: puts and signals to self are posted on qps[rank] and their receive completions arrive on
   // the responder. self_rq_qp is that responder (doca_gpu_dev_verbs_qp), whose receive queue the
-  // drain uses for the local rank.
+  // drain uses for the local rank. Its send queue carries no traffic, so it also hosts the Data
+  // Direct flushes below.
   void* self_rq_qp;
+  // Data Direct NICs write registered windows over a direct PCIe link while CQEs reach GPU memory
+  // over C2C, so a receive CQE does not imply its data is visible. When dd_flush is set, the drain
+  // posts a DUMP to the 8-byte buffer dd_flush_lkey (registered for Data Direct) on self_rq_qp and
+  // waits for it before publishing signals or get completions.
+  uint32_t dd_flush;
+  uint32_t dd_flush_lkey; // big-endian
 };
 
 struct ncclGinMrcMemHandle {
