@@ -111,6 +111,12 @@ struct ncclGinMrcGPUContext {
   uint32_t rdw_lkey;       // big-endian
   uint32_t rdw_window;     // in-flight requests per peer (power of two)
   uint32_t rdw_gen;        // generation tag carried by requests and echoed in responses
+
+  // An MRC QP cannot target itself, so qps[rank] is connected to a dedicated loopback responder
+  // QP: puts and signals to self are posted on qps[rank] and their receive completions arrive on
+  // the responder. self_rq_qp is that responder (doca_gpu_dev_verbs_qp), whose receive queue the
+  // drain uses for the local rank.
+  void* self_rq_qp;
 };
 
 struct ncclGinMrcMemHandle {

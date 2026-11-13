@@ -78,6 +78,13 @@ NCCL_DEVICE_INLINE static doca_gpu_dev_verbs_qp* getQp(ncclGinMrcGPUContext* mrc
   return (doca_gpu_dev_verbs_qp*)nccl::utility::loadConst(&mrc->qps) + peer;
 }
 
+// QP whose receive queue gets the completions of the traffic `peer` sends to this rank. For
+// the local rank that is the loopback responder (see ncclGinMrcGPUContext::self_rq_qp).
+NCCL_DEVICE_INLINE static doca_gpu_dev_verbs_qp* getRqQp(ncclGinMrcGPUContext* mrc, int peer, int rank) {
+  if (peer == rank) return (doca_gpu_dev_verbs_qp*)nccl::utility::loadConst(&mrc->self_rq_qp);
+  return getQp(mrc, peer);
+}
+
 /* ── Signal immediates ────────────────────────────────────────────── */
 
 // Immediate layout of a signal (bit 31 clear; RDW messages set kRdwFlag, see below):
@@ -592,13 +599,14 @@ NCCL_DEVICE_INLINE static void drainSignals(ncclGinCtx ctx) {
   uint64_t* counterBuf = loadConst(&mrc->counters);
   for (int peer = 0; peer < ctx.nRanks; peer++) {
     doca_gpu_dev_verbs_qp* qp = getQp(mrc, peer);
+    doca_gpu_dev_verbs_qp* rqQp = getRqQp(mrc, peer, ctx.rank);
     ncclGinMrcRqState* state = rq + peer;
     cuda::atomic_ref<int, cuda::thread_scope_device> drainLock(state->drain_lock);
     int unlocked = 0;
     if (!drainLock.compare_exchange_strong(unlocked, 1, cuda::memory_order_acquire, cuda::memory_order_relaxed))
       continue;
     uint32_t imm, opcode;
-    while (rqPollOne(qp, state, &imm, &opcode) == 0) {
+    while (rqPollOne(rqQp, state, &imm, &opcode) == 0) {
       if (opcode != kCqeRespWriteImm) continue;
       if (imm & kRdwFlag) {
         if (imm & kRdwResp)
