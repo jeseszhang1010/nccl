@@ -146,13 +146,24 @@ NVCUFLAGS_SYM :=
 NVCUFLAGS_GENK :=
 
 ########## MRC GIN backend ##########
-# Opt-in with GIN_MRC=1. Selects the MRC GIN device backend and disables GDAKI: the two vendor
-# different DOCA device-header snapshots that use the same include guards, so only one can be
-# present per translation unit. This adds a define only -- no DOCA include path and no DOCA
-# library is linked into libnccl; the MRC GIN host plugin owns all of that.
+# Opt-in with GIN_MRC=1. Selects the MRC GIN device backend and disables GDAKI (see
+# gin_device_common.h). GIN_MRC_RQ picks who drains the receive queues, which decides the DOCA
+# GPUNetIO device code (see nccl_device/gin/mrc/gin_mrc_dev.h):
+#   cpu: open-source device headers from DOCA_HOME (doca_gpu_dev_verbs_put_immediate, e.g. the
+#        GPUNetIO main branch); the plugin drains the receive queues on the CPU.
+#   gpu: DOCA SDK device headers from DOCA_SDK_HOME, driving QPs the plugin exported with
+#        doca_gpu_verbs_export_sdk_qp (GPUNetIO feature/export_sdk_qp); the GPU drains them.
+# This adds defines (and stages the SDK device headers); the MRC GIN host plugin owns the host-side
+# DOCA code and follows the mode NCCL was built with.
 GIN_MRC ?= 0
+GIN_MRC_RQ ?= cpu
 ifeq ($(GIN_MRC),1)
   GIN_MRC_FLAGS := -DNCCL_GIN_MRC_ENABLE=1
+  ifeq ($(GIN_MRC_RQ),gpu)
+    GIN_MRC_FLAGS += -DNCCL_GIN_MRC_GPU_RQ=1
+  else ifneq ($(GIN_MRC_RQ),cpu)
+    $(error GIN_MRC_RQ must be cpu or gpu, not '$(GIN_MRC_RQ)')
+  endif
   CXXFLAGS      += $(GIN_MRC_FLAGS)
   NVCUFLAGS     += $(GIN_MRC_FLAGS)
   NVCUFLAGS_SYM += $(GIN_MRC_FLAGS)

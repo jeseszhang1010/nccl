@@ -32,7 +32,6 @@ endif()
 if(NCCL_OS_LINUX)
     add_subdirectory(net_ib)
     add_subdirectory(net_efa_gda)
-    add_subdirectory(net_mrc)
 else()
     if(NCCL_OS_WINDOWS)
         add_subdirectory(net_nd)
@@ -54,6 +53,3 @@ set(DOCA_HOME ${DOCA_HOME} PARENT_SCOPE)
 
 # Add EFA-DP-Direct device headers to parent scope
 set(DEVICE_EFA_DP_HEADERS ${DEVICE_EFA_DP_HEADERS} PARENT_SCOPE)
-
-# Add MRC DOCA device headers to parent scope
-set(DEVICE_MRC_DOCA_HEADERS ${DEVICE_MRC_DOCA_HEADERS} PARENT_SCOPE)
