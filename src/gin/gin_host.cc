@@ -24,8 +24,22 @@ const int proxyBackendMinVersions[] = {0, NCCL_VERSION(2, 30, 3), NCCL_VERSION(2
 const int gdakiBackendMinVersions[] = {0, NCCL_VERSION(2, 30, 3), NCCL_VERSION(2, 30, 5)};
 const int gpiBackendMinVersions[] = {0, NCCL_VERSION(2, 30, 5)};
 constexpr int efaGdaBackendMinVersions[] = {0, NCCL_VERSION(2, 31, 0), NCCL_VERSION(2, 32, 0)};
-const int mrcBackendMinVersions[] = {0, NCCL_VERSION(2, 31, 2), NCCL_VERSION(2, 31, 2), NCCL_VERSION(2, 31, 2),
-                                     NCCL_VERSION(2, 32, 6), NCCL_VERSION(2, 32, 6), NCCL_VERSION(2, 32, 6)};
+// MRC: the backend version also tells the plugin who drains the receive queues, as the two modes
+// use different device code (see nccl_device/gin/mrc/gin_mrc_dev.h): 7 = CPU RQ, 8 = GPU RQ. A GPU
+// RQ build always selects 8, which has the same minimum NCCL version as 7.
+const int mrcBackendMinVersions[] = {0,
+                                     NCCL_VERSION(2, 31, 2),
+                                     NCCL_VERSION(2, 31, 2),
+                                     NCCL_VERSION(2, 31, 2),
+                                     NCCL_VERSION(2, 32, 6),
+                                     NCCL_VERSION(2, 32, 6),
+                                     NCCL_VERSION(2, 32, 6),
+                                     NCCL_VERSION(2, 32, 6)
+#if NCCL_GIN_MRC_GPU_RQ
+                                     ,
+                                     NCCL_VERSION(2, 32, 6)
+#endif
+};
 
 ncclResult_t ncclGetGinType(struct ncclComm* comm, ncclGinType_t* ginType) {
   if (comm == nullptr || ginType == nullptr) return ncclInternalError;
