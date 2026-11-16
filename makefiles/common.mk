@@ -151,8 +151,8 @@ NVCUFLAGS_GENK :=
 # GPUNetIO device code (see nccl_device/gin/mrc/gin_mrc_dev.h):
 #   cpu: open-source device headers from DOCA_HOME (doca_gpu_dev_verbs_put_immediate, e.g. the
 #        GPUNetIO main branch); the plugin drains the receive queues on the CPU.
-#   gpu: DOCA SDK device headers from DOCA_SDK_HOME, driving QPs the plugin exported with
-#        doca_gpu_verbs_export_sdk_qp (GPUNetIO feature/export_sdk_qp); the GPU drains them.
+#   gpu: DOCA SDK device headers from DOCA_SDK_HOME, driving the DOCA SDK GPU handlers of the
+#        plugin's QPs; the GPU drains them.
 # This adds defines (and stages the SDK device headers); the MRC GIN host plugin owns the host-side
 # DOCA code and follows the mode NCCL was built with.
 GIN_MRC ?= 0

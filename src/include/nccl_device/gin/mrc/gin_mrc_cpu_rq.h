@@ -9,9 +9,9 @@
  * operation, so the signal is ordered behind its payload. The immediate packs
  * the signal op, id and value (DOCA_GPUNETIO_VERBS_SIGNAL_IMM_*); a
  * ncclGin_SignalAdd value that does not fit is split into several adds. The
- * receive queues are managed by the CPU: the host plugin drains them with
- * doca_gpu_verbs_rq_progress() into a per-context DOCA GPUNetIO signal map,
- * which adds each immediate's value to the GPU slot registered for its id.
+ * receive queues are managed by the CPU: the host plugin drains them into a
+ * per-context signal map, which adds each immediate's value to the GPU slot
+ * registered for its id (doca_gpu_verbs_rq_progress() semantics).
  * Device code only reads signal slots; a reset records a baseline (see
  * ncclGinMrcGPUContext::signal_base).
  *

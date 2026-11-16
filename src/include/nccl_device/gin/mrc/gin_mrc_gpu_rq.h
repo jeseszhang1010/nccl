@@ -4,12 +4,11 @@
  * MRC GIN device backend, GPU RQ mode (NCCL_GIN_MRC_GPU_RQ=1). Included by
  * gin_mrc.h, which describes both modes.
  *
- * The host plugin creates its QPs with the open-source DOCA GPUNetIO library
- * and exports each one to the DOCA SDK with doca_gpu_verbs_export_sdk_qp(),
- * whose result is a DOCA SDK doca_gpu_dev_verbs_qp. This device code is
- * therefore built against the DOCA SDK device headers (DOCA_SDK_HOME): they
- * can post receive WQEs and poll receive CQs, which the open-source device
- * headers cannot.
+ * The host plugin creates its QPs with the DOCA SDK and exports each one with
+ * doca_gpu_verbs_export_qp(), whose GPU handler is a DOCA SDK
+ * doca_gpu_dev_verbs_qp. This device code is therefore built against the DOCA
+ * SDK device headers (DOCA_SDK_HOME): they can post receive WQEs and poll
+ * receive CQs, which the open-source device headers cannot.
  *   - A signal is an inbound Write-with-Immediate carrying the signal id (and,
  *     for SignalAdd, the value, split across several immediates if needed). The
  *     receiver posts receive WQEs and drains its receive CQ to apply them to a

@@ -17,8 +17,8 @@
  *   - CPU RQ (gin_mrc_cpu_rq.h): open-source GPUNetIO device code with
  *     doca_gpu_dev_verbs_put_immediate; the host plugin drains the receive
  *     queues into DOCA GPUNetIO signal maps.
- *   - GPU RQ (gin_mrc_gpu_rq.h): DOCA SDK device code drives QPs the plugin
- *     exported with doca_gpu_verbs_export_sdk_qp, and drains the receive queues.
+ *   - GPU RQ (gin_mrc_gpu_rq.h): DOCA SDK device code drives the DOCA SDK GPU
+ *     handlers of the plugin's QPs, and drains the receive queues.
  * The two use different DOCA device headers that cannot share a translation
  * unit, so one NCCL build supports one mode.
  *
