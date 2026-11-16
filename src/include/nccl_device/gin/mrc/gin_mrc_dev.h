@@ -22,10 +22,10 @@
 // has a receive queue. Who drains it is chosen when NCCL is built (GIN_MRC_RQ), as the two ways use
 // different DOCA GPUNetIO device code:
 //   CPU RQ (NCCL_GIN_MRC_GPU_RQ=0): device code from the open-source GPUNetIO (DOCA_HOME) posts
-//     with doca_gpu_dev_verbs_put_immediate; the plugin drains the receive queues on the CPU
-//     (doca_gpu_verbs_rq_progress) into per-context DOCA GPUNetIO signal maps.
-//   GPU RQ (NCCL_GIN_MRC_GPU_RQ=1): the plugin exports its QPs to the DOCA SDK
-//     (doca_gpu_verbs_export_sdk_qp), and device code built against the DOCA SDK device headers
+//     with doca_gpu_dev_verbs_put_immediate; the plugin drains the receive queues on the CPU into
+//     per-context signal maps, with the semantics of the open-source doca_gpu_verbs_rq_progress.
+//   GPU RQ (NCCL_GIN_MRC_GPU_RQ=1): the plugin exports its QPs to DOCA SDK GPU handlers
+//     (doca_gpu_verbs_export_qp), and device code built against the DOCA SDK device headers
 //     posts the receive WQEs and drains the receive CQs itself.
 // NCCL tells the plugin which one its device code implements through the backend version it passes
 // to createContext, which is also the layout of the structs below that the device code reads.
@@ -113,7 +113,7 @@ struct ncclGinMrcMrTable {
 struct ncclGinMrcGPUContext {
   // The QP to each peer. CPU RQ mode: qps is an array of the open-source GPUNetIO
   // doca_gpu_dev_verbs_qp, one per peer. GPU RQ mode: sdk_qps is an array of GPU pointers to the
-  // DOCA SDK doca_gpu_dev_verbs_qp each QP was exported to (doca_gpu_verbs_export_sdk_qp).
+  // DOCA SDK doca_gpu_dev_verbs_qp each QP was exported to (doca_gpu_verbs_export_qp).
   void* qps;
   void** sdk_qps;
   struct ncclGinMrcPeerState* peers; // [nRanks]
