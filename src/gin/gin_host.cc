@@ -25,10 +25,8 @@ const int proxyBackendMinVersions[] = {0, NCCL_VERSION(2, 30, 3), NCCL_VERSION(2
 const int gdakiBackendMinVersions[] = {0, NCCL_VERSION(2, 30, 3), NCCL_VERSION(2, 30, 5)};
 const int gpiBackendMinVersions[] = {0, NCCL_VERSION(2, 30, 5)};
 constexpr int efaGdaBackendMinVersions[] = {0, NCCL_VERSION(2, 31, 0), NCCL_VERSION(2, 32, 0)};
-// MRC: the backend version also tells the plugin who drains the receive queues, as the two modes
-// use different device code (see nccl_device/gin/mrc/gin_mrc_dev.h): NCCL_GIN_MRC_VERSION_CPU_RQ (9)
-// or NCCL_GIN_MRC_VERSION_GPU_RQ (10); 7/8 are the earlier layouts with a sink slot, which this
-// device code no longer reads. A CPU RQ build selects 9 and a GPU RQ build 10, the last entry.
+// MRC: the last entry is NCCL_GIN_MRC_VERSION (nccl_device/gin/mrc/gin_mrc_dev.h), the layout this
+// device code reads, with CPU-managed receive queues. Earlier versions are layouts it no longer reads.
 const int mrcBackendMinVersions[] = {0,
                                      NCCL_VERSION(2, 31, 2),
                                      NCCL_VERSION(2, 31, 2),
@@ -38,19 +36,11 @@ const int mrcBackendMinVersions[] = {0,
                                      NCCL_VERSION(2, 32, 6),
                                      NCCL_VERSION(2, 32, 6),
                                      NCCL_VERSION(2, 32, 6),
-                                     NCCL_VERSION(2, 32, 6)
-#if NCCL_GIN_MRC_GPU_RQ
-                                     ,
-                                     NCCL_VERSION(2, 32, 6)
-#endif
-};
-#if NCCL_GIN_MRC_GPU_RQ
-static_assert(sizeof(mrcBackendMinVersions) / sizeof(int) == 1 + NCCL_GIN_MRC_VERSION_GPU_RQ,
-              "mrcBackendMinVersions must end at this build's MRC backend version");
-#else
-static_assert(sizeof(mrcBackendMinVersions) / sizeof(int) == 1 + NCCL_GIN_MRC_VERSION_CPU_RQ,
-              "mrcBackendMinVersions must end at this build's MRC backend version");
-#endif
+                                     NCCL_VERSION(2, 32, 6),
+                                     NCCL_VERSION(2, 32, 6),
+                                     NCCL_VERSION(2, 32, 6)};
+static_assert(sizeof(mrcBackendMinVersions) / sizeof(int) == 1 + NCCL_GIN_MRC_VERSION,
+              "mrcBackendMinVersions must end at NCCL_GIN_MRC_VERSION");
 
 ncclResult_t ncclGetGinType(struct ncclComm* comm, ncclGinType_t* ginType) {
   if (comm == nullptr || ginType == nullptr) return ncclInternalError;
