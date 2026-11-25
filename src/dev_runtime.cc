@@ -1443,10 +1443,9 @@ static void ncclDevCommEfaGdaDump(void* handle) {
 static void ncclDevCommMrcDump(void* handle) {
   struct ncclGinMrcGPUContext ctx;
   if (cudaMemcpy(&ctx, handle, sizeof(ctx), cudaMemcpyDeviceToHost) == cudaSuccess) {
-    printf("    MRC qps %p sdk qps %p self rq qp %p peers %p self loop %s\n", ctx.qps, ctx.sdk_qps, ctx.self_rq_qp,
-           ctx.peers, ctx.self_loop_off ? "off" : "on");
-    printf("    MRC signals %p base %p rdw ids %u counters %p\n", ctx.signals, ctx.signal_base, ctx.rdw_signal_base,
-           ctx.counters);
+    printf("    MRC sdk qps %p self rq qp %p peers %p self loop %s\n", ctx.sdk_qps, ctx.self_rq_qp, ctx.peers,
+           ctx.self_loop_off ? "off" : "on");
+    printf("    MRC signals %p counters %p\n", ctx.signals, ctx.counters);
   }
 }
 
