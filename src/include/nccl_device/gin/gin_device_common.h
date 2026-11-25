@@ -29,9 +29,7 @@
 #endif
 #endif
 
-// MRC is opt-in. With GIN_MRC_RQ=cpu it uses the same DOCA GPUNetIO device headers as GDAKI
-// (DOCA_HOME), which must then be an open-source GPUNetIO release with put_immediate; with
-// GIN_MRC_RQ=gpu it uses the DOCA SDK device headers, which exclude GDAKI. Building with
+// MRC is opt-in. It uses the DOCA SDK device headers, which exclude GDAKI. Building with
 // -DNCCL_GIN_MRC_ENABLE=1 selects MRC and, unless NCCL_GIN_GDAKI_ENABLE is given explicitly, turns
 // GDAKI off so GIN calls dispatch to a single backend.
 #ifndef NCCL_GIN_MRC_ENABLE

@@ -1,8 +1,8 @@
 /*************************************************************************
  * SPDX-License-Identifier: Apache-2.0
  *
- * MRC GIN device backend, GPU RQ mode (NCCL_GIN_MRC_GPU_RQ=1). Included by
- * gin_mrc.h, which describes both modes.
+ * MRC GIN device backend with GPU-managed receive queues. Included by
+ * gin_mrc.h.
  *
  * The host plugin creates its QPs with the DOCA SDK and exports each one with
  * doca_gpu_verbs_export_qp(), whose GPU handler is a DOCA SDK
@@ -41,7 +41,7 @@
 // The DOCA SDK device headers share include guards with GDAKI's open-source ones but not their
 // layout, so the two cannot be compiled together.
 #if NCCL_GIN_GDAKI_ENABLE
-#error "MRC GIN with GIN_MRC_RQ=gpu (DOCA SDK device code) cannot be combined with NCCL_GIN_GDAKI_ENABLE"
+#error "MRC GIN (DOCA SDK device code) cannot be combined with NCCL_GIN_GDAKI_ENABLE"
 #endif
 
 // The NCCL build stages the DOCA SDK device headers next to this one (doca_sdk/), so applications
@@ -232,7 +232,6 @@ NCCL_DEVICE_INLINE void rqInit(struct doca_gpu_dev_verbs_qp* qp, struct ncclGinM
   state->get_lock = 0;
   state->add_acc = 0;
   state->add_shift = 0;
-  state->rdw_served = 0;
 
   // The slot table must be a power-of-two at least as large as the SQ ring so that every
   // outstanding WQE index maps to a unique slot; disable counters otherwise.
