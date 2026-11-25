@@ -1,8 +1,8 @@
 /*************************************************************************
  * SPDX-License-Identifier: Apache-2.0
  *
- * MRC GIN device backend, CPU RQ mode (NCCL_GIN_MRC_GPU_RQ=0). Included by
- * gin_mrc.h, which describes both modes.
+ * MRC GIN device backend with CPU-managed receive queues. Included by
+ * gin_mrc.h.
  *
  * A signal is the immediate of a Write-with-Immediate, posted with
  * doca_gpu_dev_verbs_put_immediate(): the data and the signal are a single

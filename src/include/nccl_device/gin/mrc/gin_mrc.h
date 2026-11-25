@@ -11,16 +11,9 @@
  * while it runs a kernel that drives GIN progress (any signal/counter read or
  * wait, flush, or wait on a request).
  *
- * Who drains the receive queues is chosen when NCCL is built (GIN_MRC_RQ, see
- * gin_mrc_dev.h), and recorded in the installed gin_mrc_config.h so that
- * applications compile the same device code:
- *   - CPU RQ (gin_mrc_cpu_rq.h): open-source GPUNetIO device code with
- *     doca_gpu_dev_verbs_put_immediate; the host plugin drains the receive
- *     queues into DOCA GPUNetIO signal maps.
- *   - GPU RQ (gin_mrc_gpu_rq.h): DOCA SDK device code drives the DOCA SDK GPU
- *     handlers of the plugin's QPs, and drains the receive queues.
- * The two use different DOCA device headers that cannot share a translation
- * unit, so one NCCL build supports one mode.
+ * The receive queues are managed by the CPU: the host plugin drains them into
+ * per-context signal maps, and device code posts with the open-source DOCA
+ * GPUNetIO doca_gpu_dev_verbs_put_immediate (gin_mrc_cpu_rq.h).
  *
  * The GPU-resident context is created by the out-of-tree host plugin; its layout
  * is gin_mrc_dev.h.
@@ -33,11 +26,8 @@
 #include <cassert>
 #include <cstdint>
 
-#if __has_include("gin_mrc_config.h")
-#include "gin_mrc_config.h"
-#endif
-#ifndef NCCL_GIN_MRC_GPU_RQ
-#define NCCL_GIN_MRC_GPU_RQ 0
+#if defined(NCCL_GIN_MRC_GPU_RQ) && NCCL_GIN_MRC_GPU_RQ
+#error "This NCCL implements MRC GIN with CPU-managed receive queues only (NCCL_GIN_MRC_GPU_RQ is not supported)"
 #endif
 
 #include "nccl_device/utility.h"
@@ -52,14 +42,10 @@ struct ncclGinMrcRequest {
 static_assert(sizeof(ncclGinMrcRequest) <= sizeof(ncclGinRequest_t),
               "ncclGinMrcRequest must fit in ncclGinRequest_t");
 
-// Each mode implements the same functions in nccl::gin::mrc for the API below: getCtx,
+// gin_mrc_cpu_rq.h implements the functions in nccl::gin::mrc for the API below: getCtx,
 // encodeSignal, putImpl, putValueImpl, getImpl, flushAsyncImpl, waitImpl, flushImpl, progress,
 // resetSignal and signalPtr.
-#if NCCL_GIN_MRC_GPU_RQ
-#include "gin_mrc_gpu_rq.h"
-#else
 #include "gin_mrc_cpu_rq.h"
-#endif
 
 namespace nccl {
 namespace gin {
@@ -270,8 +256,8 @@ struct ncclGinApi_GetCounterPtr<NCCL_NET_DEVICE_GIN_MRC> {
   }
 };
 
-// Device-side progress (receive drain in GPU RQ mode, counters and RDW get serving in both): the
-// wait loops must call this or they spin forever.
+// Device-side progress (counters and RDW get serving): the wait loops must call this or they spin
+// forever.
 template <>
 struct ncclGinApi_Progress<NCCL_NET_DEVICE_GIN_MRC> {
   NCCL_DEVICE_INLINE static void call(ncclGinCtx ctx) {
