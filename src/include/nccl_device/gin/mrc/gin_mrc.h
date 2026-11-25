@@ -61,6 +61,24 @@ static_assert(sizeof(ncclGinMrcRequest) <= sizeof(ncclGinRequest_t),
 #include "gin_mrc_cpu_rq.h"
 #endif
 
+namespace nccl {
+namespace gin {
+namespace mrc {
+// Without the self loop (NCCL_GIN_MRC_SELF_LOOP=0) the QP to the local rank is not connected, so
+// an operation on it would never complete. Self traffic should go over LSA instead; GIN barriers
+// fenced with ncclGinFenceLevel::Put (the default) signal the local rank too.
+NCCL_DEVICE_INLINE static void checkSelfLoop(ncclGinCtx ctx, int peer) {
+  if (peer == ctx.rank && nccl::utility::loadConst(&getCtx(ctx)->self_loop_off)) {
+    printf("NCCL GIN/MRC: rank %d context %d: GIN put/signal/get to the local rank needs the self loop "
+           "(NCCL_GIN_MRC_SELF_LOOP=1)\n",
+           ctx.rank, ctx.contextId);
+    __trap();
+  }
+}
+} // namespace mrc
+} // namespace gin
+} // namespace nccl
+
 template <>
 struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_MRC> {
   template <typename Coop>
@@ -75,6 +93,7 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_MRC> {
     // Signals ride Write-with-Immediate carrying the signal id (and Add value), so only INDEXED
     // signals are representable.
     assert(signal.type != NCCL_GIN_SIGNAL_TYPE_VA && "MRC GIN: VA signals are not supported");
+    nccl::gin::mrc::checkSelfLoop(ctx, peer);
     bool hasSignal = signal.type == NCCL_GIN_SIGNAL_TYPE_INDEXED;
     uint32_t signalId = hasSignal ? (uint32_t)signal.indexedSignal.signalId : 0;
     nccl::gin::mrc::putImpl(ctx, coop, peer, hasWins, dstWin, dstOff, srcWin, srcOff, bytes,
@@ -94,6 +113,7 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_MRC> {
     (void)hasDescriptor;
     (void)descriptor;
     assert(signal.type != NCCL_GIN_SIGNAL_TYPE_VA && "MRC GIN: VA signals are not supported");
+    nccl::gin::mrc::checkSelfLoop(ctx, peer);
     bool hasSignal = signal.type == NCCL_GIN_SIGNAL_TYPE_INDEXED;
     uint32_t signalId = hasSignal ? (uint32_t)signal.indexedSignal.signalId : 0;
     nccl::gin::mrc::putValueImpl(ctx, coop, peer, dstWin, dstOff, srcVal,
@@ -110,6 +130,7 @@ struct ncclGinApi_Get<NCCL_NET_DEVICE_GIN_MRC> {
                                       ncclGinWindow_t localWin, size_t localOff, size_t bytes, bool hasDescriptor,
                                       ncclGinDescriptorSmem* descriptor, uint32_t optFlags = ncclGinOptFlagsDefault) {
     (void)hasDescriptor, (void)descriptor, (void)optFlags;
+    nccl::gin::mrc::checkSelfLoop(ctx, peer);
     nccl::gin::mrc::getImpl(ctx, coop, peer, remoteWin, remoteOff, localWin, localOff, bytes);
   }
 };

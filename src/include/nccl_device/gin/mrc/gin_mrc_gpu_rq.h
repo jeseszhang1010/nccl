@@ -12,7 +12,8 @@
  *   - A signal is an inbound Write-with-Immediate carrying the signal id (and,
  *     for SignalAdd, the value, split across several immediates if needed). The
  *     receiver posts receive WQEs and drains its receive CQ to apply them to a
- *     local signal array (see drainSignals).
+ *     local signal array (see drainSignals). A signal without data is a
+ *     zero-length Write-with-Immediate, which carries no data segment.
  *   - Get uses Receiver-Driven Write (RDW): the requester writes a request
  *     descriptor into the data owner's request ring with a Write-with-Immediate;
  *     the owner's receive drain serves it with RDMA Writes back to the requester
@@ -83,7 +84,8 @@ NCCL_DEVICE_INLINE static doca_gpu_dev_verbs_qp* getQp(ncclGinMrcGPUContext* mrc
 }
 
 // QP whose receive queue gets the completions of the traffic `peer` sends to this rank. For
-// the local rank that is the loopback responder (see ncclGinMrcGPUContext::self_rq_qp).
+// the local rank that is the loopback responder (see ncclGinMrcGPUContext::self_rq_qp), or NULL
+// when the plugin built no self loop.
 NCCL_DEVICE_INLINE static doca_gpu_dev_verbs_qp* getRqQp(ncclGinMrcGPUContext* mrc, int peer, int rank) {
   if (peer == rank) return (doca_gpu_dev_verbs_qp*)nccl::utility::loadConst(&mrc->self_rq_qp);
   return getQp(mrc, peer);
@@ -153,7 +155,6 @@ enum : uint32_t {
 static constexpr uint32_t kRdwDescBytes = NCCL_GIN_MRC_RDW_DESC_BYTES;
 static constexpr uint32_t kRdwMaxSubs = 4;
 static constexpr uint32_t kRdwMaxSubBytes = 8u << 20;
-static constexpr uint32_t kRdwRespBytes = sizeof(uint64_t);
 
 struct ncclGinMrcGetSub {
   uint32_t src_lo, src_hi; // offset in the server's window (zero-based MR)
@@ -184,9 +185,6 @@ NCCL_DEVICE_INLINE static uint64_t rdwRingOffset(uint32_t window, int requester,
 }
 NCCL_DEVICE_INLINE static uint64_t rdwStagingOffset(int nRanks, uint32_t window, int peer, uint32_t slot) {
   return ((uint64_t)nRanks * window + (uint64_t)peer * window + slot) * kRdwDescBytes;
-}
-NCCL_DEVICE_INLINE static uint64_t rdwRespOffset(int nRanks, uint32_t window) {
-  return 2ull * nRanks * window * kRdwDescBytes;
 }
 
 /* ── Receive queue: one-time fill and non-blocking drain ──────────── */
@@ -329,13 +327,44 @@ NCCL_DEVICE_INLINE static void recordCounter(ncclGinMrcPeerState* state, uint64_
     .fetch_add(1, cuda::memory_order_relaxed);
 }
 
+// Remote target of a zero-length write to peer: the NIC accesses no memory, but the WQE still names
+// a valid key, the peer's RDW MR (registered for every context).
+NCCL_DEVICE_INLINE static doca_gpu_dev_verbs_addr bareTarget(ncclGinMrcGPUContext* mrc, int peer) {
+  using nccl::utility::loadConst;
+  doca_gpu_dev_verbs_addr raddr;
+  raddr.addr = loadConst(&mrc->rdw_ctx_offset);
+  raddr.key = loadConst(loadConst(&mrc->rdw_rkeys) + peer);
+  return raddr;
+}
+
+// Zero-length RDMA Write (with Immediate when opcode says so): control and remote-address segments
+// only. The DOCA SDK's doca_gpu_dev_verbs_wqe_prepare_write always adds a data segment, and an mlx5
+// data segment with a byte count of 0 means 2 GiB. immBe is the immediate in wire byte order.
+NCCL_DEVICE_INLINE static void prepareZeroLengthWrite(doca_gpu_dev_verbs_qp* qp, doca_gpu_dev_verbs_wqe* wqe_ptr,
+                                                      uint16_t wqe_idx, uint32_t opcode, uint32_t immBe,
+                                                      doca_gpu_dev_verbs_addr raddr) {
+  struct doca_gpu_dev_verbs_wqe_ctrl_seg cseg;
+  struct mlx5_wqe_raddr_seg rseg;
+  cseg.opmod_idx_opcode = doca_gpu_dev_verbs_bswap32(((uint32_t)wqe_idx << DOCA_GPUNETIO_VERBS_WQE_IDX_SHIFT) | opcode);
+  cseg.qpn_ds = __ldg(&qp->sq_num_shift8_be_2ds);
+  cseg.fm_ce_se = DOCA_GPUNETIO_MLX5_WQE_CTRL_CQ_UPDATE;
+  cseg.imm = immBe;
+  rseg.raddr = doca_gpu_dev_verbs_bswap64(raddr.addr);
+#if DOCA_GPUNETIO_VERBS_MKEY_SWAPPED == 1
+  rseg.rkey = raddr.key;
+#else
+  rseg.rkey = doca_gpu_dev_verbs_bswap32(raddr.key);
+#endif
+  rseg.reserved = 0;
+  doca_gpu_dev_verbs_store_wqe_seg((uint64_t*)&(wqe_ptr->dseg0), (uint64_t*)&(cseg));
+  doca_gpu_dev_verbs_store_wqe_seg((uint64_t*)&(wqe_ptr->dseg1), (uint64_t*)&(rseg));
+}
+
 // Posts a (possibly chunked) RDMA Write; when useImm is set the last chunk is an RDMA
-// Write-with-Immediate carrying signalId. bytes must be non-zero: MRC rejects zero-length
-// Write-with-Immediate, so callers send bare signals through the sink scratch instead (see
-// writeSignaled). When counterState is non-null the last WQE index
-// is recorded for send-CQ counter draining before the doorbell rings. Must be called by a
-// single thread; the QP uses a GPU-SM doorbell so the submit rings the NIC directly.
-// Returns the last reserved WQE index.
+// Write-with-Immediate carrying signalId. bytes == 0 posts one zero-length WQE (laddr is unused).
+// When counterState is non-null the last WQE index is recorded for send-CQ counter draining
+// before the doorbell rings. Must be called by a single thread; the QP uses a GPU-SM doorbell so
+// the submit rings the NIC directly. Returns the last reserved WQE index.
 template <enum doca_gpu_dev_verbs_resource_sharing_mode resource_sharing_mode>
 NCCL_DEVICE_INLINE static uint64_t write(doca_gpu_dev_verbs_qp* qp, doca_gpu_dev_verbs_addr raddr,
                                          doca_gpu_dev_verbs_addr laddr, size_t bytes, bool useImm, uint32_t signalId,
@@ -353,6 +382,12 @@ NCCL_DEVICE_INLINE static uint64_t write(doca_gpu_dev_verbs_qp* qp, doca_gpu_dev
       remaining > DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE ? DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE : remaining;
     const bool last = (i + 1 == num_chunks);
     doca_gpu_dev_verbs_wqe* wqe_ptr = doca_gpu_dev_verbs_get_wqe_ptr(qp, wqe_idx);
+    if (bytes == 0) {
+      prepareZeroLengthWrite(qp, wqe_ptr, wqe_idx,
+                             useImm ? DOCA_GPUNETIO_MLX5_OPCODE_RDMA_WRITE_IMM : DOCA_GPUNETIO_MLX5_OPCODE_RDMA_WRITE,
+                             useImm ? immBe : 0, raddr);
+      break;
+    }
     doca_gpu_dev_verbs_wqe_prepare_write(
       qp, wqe_ptr, wqe_idx,
       (last && useImm) ? DOCA_GPUNETIO_MLX5_OPCODE_RDMA_WRITE_IMM : DOCA_GPUNETIO_MLX5_OPCODE_RDMA_WRITE,
@@ -372,10 +407,9 @@ NCCL_DEVICE_INLINE static uint64_t write(doca_gpu_dev_verbs_qp* qp, doca_gpu_dev
 
 // Posts an optional data write followed by the signal immediates in sig, in one WQE reservation
 // so a multi-chunk Add reaches the peer contiguously. The first immediate rides the last data WQE
-// when there is data; every other immediate (and a counter-only op without data) is an 8-byte
-// write of the local sink scratch into the peer's reserved sink slot, because MRC rejects
-// zero-length writes. When counterState is non-null the last WQE index is recorded for send-CQ
-// counter draining. Must be called by a single thread. Returns the last reserved WQE index.
+// when there is data; every other immediate (and a counter-only op without data) is a zero-length
+// write. When counterState is non-null the last WQE index is recorded for send-CQ counter
+// draining. Must be called by a single thread. Returns the last reserved WQE index.
 template <enum doca_gpu_dev_verbs_resource_sharing_mode resource_sharing_mode>
 NCCL_DEVICE_INLINE static uint64_t writeSignaled(ncclGinMrcGPUContext* mrc, doca_gpu_dev_verbs_qp* qp, int peer,
                                                  doca_gpu_dev_verbs_addr raddr, doca_gpu_dev_verbs_addr laddr,
@@ -384,9 +418,9 @@ NCCL_DEVICE_INLINE static uint64_t writeSignaled(ncclGinMrcGPUContext* mrc, doca
   using nccl::utility::loadConst;
   const uint64_t num_data =
     (bytes == 0) ? 0 : doca_gpu_dev_verbs_div_ceil_aligned_pow2(bytes, DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE_SHIFT);
-  uint32_t num_sink = (num_data > 0) ? (sig.n > 0 ? sig.n - 1 : 0) : sig.n;
-  if (num_data == 0 && num_sink == 0) num_sink = 1; // counter-only op without data
-  const uint64_t base_wqe_idx = doca_gpu_dev_verbs_reserve_wq_slots<resource_sharing_mode>(qp, num_data + num_sink);
+  uint32_t num_bare = (num_data > 0) ? (sig.n > 0 ? sig.n - 1 : 0) : sig.n;
+  if (num_data == 0 && num_bare == 0) num_bare = 1; // counter-only op without data
+  const uint64_t base_wqe_idx = doca_gpu_dev_verbs_reserve_wq_slots<resource_sharing_mode>(qp, num_data + num_bare);
   uint64_t wqe_idx = base_wqe_idx;
 
   size_t remaining = bytes;
@@ -404,18 +438,14 @@ NCCL_DEVICE_INLINE static uint64_t writeSignaled(ncclGinMrcGPUContext* mrc, doca
     remaining -= size_;
   }
 
-  const uint64_t sinkRaddr = sizeof(uint64_t) * loadConst(&mrc->signals_sink_offset);
-  const uint32_t sinkRkey = loadConst(loadConst(&mrc->signal_rkeys) + peer);
-  const uint32_t sinkLkey = loadConst(&mrc->sink_lkey);
-  const uint32_t firstSinkImm = (num_data > 0) ? 1 : 0;
-  for (uint32_t k = 0; k < num_sink; k++) {
+  const doca_gpu_dev_verbs_addr bare = bareTarget(mrc, peer);
+  const uint32_t firstBareImm = (num_data > 0) ? 1 : 0;
+  for (uint32_t k = 0; k < num_bare; k++) {
     wqe_idx = base_wqe_idx + num_data + k;
-    const bool hasImm = firstSinkImm + k < sig.n;
-    doca_gpu_dev_verbs_wqe_prepare_write(
-      qp, doca_gpu_dev_verbs_get_wqe_ptr(qp, wqe_idx), wqe_idx,
-      hasImm ? DOCA_GPUNETIO_MLX5_OPCODE_RDMA_WRITE_IMM : DOCA_GPUNETIO_MLX5_OPCODE_RDMA_WRITE,
-      DOCA_GPUNETIO_MLX5_WQE_CTRL_CQ_UPDATE, hasImm ? doca_gpu_dev_verbs_bswap32(sig.imm[firstSinkImm + k]) : 0,
-      sinkRaddr, sinkRkey, 0, sinkLkey, sizeof(uint64_t));
+    const bool hasImm = firstBareImm + k < sig.n;
+    prepareZeroLengthWrite(qp, doca_gpu_dev_verbs_get_wqe_ptr(qp, wqe_idx), wqe_idx,
+                           hasImm ? DOCA_GPUNETIO_MLX5_OPCODE_RDMA_WRITE_IMM : DOCA_GPUNETIO_MLX5_OPCODE_RDMA_WRITE,
+                           hasImm ? doca_gpu_dev_verbs_bswap32(sig.imm[firstBareImm + k]) : 0, bare);
   }
 
   doca_gpu_dev_verbs_mark_wqes_ready<resource_sharing_mode>(qp, base_wqe_idx, wqe_idx);
@@ -530,15 +560,10 @@ NCCL_DEVICE_INLINE static void rdwServe(ncclGinCtx ctx, ncclGinMrcGPUContext* mr
     }
   }
 
-  // MRC rejects zero-length Write-with-Immediate: the response carries 8 scratch bytes into the
-  // requester's response landing slot.
-  doca_gpu_dev_verbs_addr raddr, laddr;
-  raddr.addr = loadConst(&mrc->rdw_ctx_offset) + rdwRespOffset(ctx.nRanks, window);
-  raddr.key = loadConst(loadConst(&mrc->rdw_rkeys) + requester);
-  laddr.addr = 0;
-  laddr.key = loadConst(&mrc->sink_lkey);
-  write<resource_sharing_mode>(qp, raddr, laddr, kRdwRespBytes, /*useImm=*/true, rdwResponseImm(imm, status), nullptr,
-                               0);
+  // The response is a zero-length Write-with-Immediate: its immediate carries the status.
+  const doca_gpu_dev_verbs_addr none = {};
+  write<resource_sharing_mode>(qp, bareTarget(mrc, requester), none, 0, /*useImm=*/true, rdwResponseImm(imm, status),
+                               nullptr, 0);
 }
 
 NCCL_DEVICE_INLINE static void rdwServeDispatch(ncclGinCtx ctx, ncclGinMrcGPUContext* mrc, doca_gpu_dev_verbs_qp* qp,
@@ -655,7 +680,7 @@ NCCL_DEVICE_INLINE static void drainSignals(ncclGinCtx ctx) {
     int unlocked = 0;
     if (!drainLock.compare_exchange_strong(unlocked, 1, cuda::memory_order_acquire, cuda::memory_order_relaxed))
       continue;
-    bool more = true;
+    bool more = rqQp != nullptr;
     while (more) {
       // Collect a batch so one Data Direct flush covers all of it; requests are served at once
       // since their descriptors are not written over Data Direct.
@@ -683,9 +708,10 @@ NCCL_DEVICE_INLINE static void drainSignals(ncclGinCtx ctx) {
 /* ── Put / PutValue ───────────────────────────────────────────────── */
 
 // Data-only puts use a plain RDMA Write; a put carrying a signal, or a bare signal, is delivered
-// via Write-with-Immediate encoding the signal (see encodeSignal). A zero-byte put is sent like a
-// bare signal (MRC rejects zero-length writes), and is a no-op when it carries neither a signal
-// nor a counter.
+// via Write-with-Immediate encoding the signal (see encodeSignal), zero-length for a bare signal. A
+// zero-byte put is sent like a bare signal, and is a no-op when it carries neither a signal nor a
+// counter. Like data puts, a bare signal does not wait for its completion: later reservations
+// (slot availability) and flush() reap it.
 template <enum doca_gpu_dev_verbs_resource_sharing_mode resource_sharing_mode, typename Coop>
 NCCL_DEVICE_INLINE static void putImplMode(ncclGinCtx ctx, Coop coop, int peer, bool hasWins,
                                            ncclGinWindow_t dstWin, size_t dstOff, ncclGinWindow_t srcWin, size_t srcOff,
@@ -713,16 +739,8 @@ NCCL_DEVICE_INLINE static void putImplMode(ncclGinCtx ctx, Coop coop, int peer, 
       laddr.addr = srcOff;
       laddr.key = loadConst(&((ncclGinMrcMemHandle*)srcWin)->lkey);
     }
-    const uint64_t lastWqeIdx = writeSignaled<resource_sharing_mode>(mrc, qp, peer, raddr, laddr,
-                                                                     hasData ? bytes : 0, sig, counterState, counterId);
-    if (!hasData) {
-      // Confirm the local send completed before this thread (possibly the last one touching this
-      // QP this round) moves on; bare signals otherwise have nothing else that consumes their SQ
-      // CQE, so wait on this specific ticket rather than relying on a later reservation to
-      // implicitly observe it.
-      doca_gpu_dev_verbs_ticket_t sigTicket = static_cast<doca_gpu_dev_verbs_ticket_t>(lastWqeIdx);
-      doca_gpu_dev_verbs_wait<resource_sharing_mode>(qp, &sigTicket);
-    }
+    writeSignaled<resource_sharing_mode>(mrc, qp, peer, raddr, laddr, hasData ? bytes : 0, sig, counterState,
+                                         counterId);
   }
   coop.sync();
 }
@@ -752,8 +770,8 @@ NCCL_DEVICE_INLINE static void putImpl(ncclGinCtx ctx, Coop coop, int peer, bool
 }
 
 // The small value is delivered by an inline RDMA Write; when a signal is requested, following
-// 8-byte sink writes carry the signal immediates (MRC rejects zero-length writes). Same-QP
-// ordering guarantees the value lands before the notification is observed.
+// zero-length Write-with-Immediates carry the signal immediates. Same-QP ordering guarantees the
+// value lands before the notification is observed.
 template <enum doca_gpu_dev_verbs_resource_sharing_mode resource_sharing_mode, typename Coop, typename T>
 NCCL_DEVICE_INLINE static void putValueImplMode(ncclGinCtx ctx, Coop coop, int peer, ncclGinWindow_t dstWin,
                                                 size_t dstOff, T srcData, const ncclGinMrcSignalImms& sig,

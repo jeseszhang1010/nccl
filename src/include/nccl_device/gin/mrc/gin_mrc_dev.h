@@ -29,8 +29,10 @@
 //     posts the receive WQEs and drains the receive CQs itself.
 // NCCL tells the plugin which one its device code implements through the backend version it passes
 // to createContext, which is also the layout of the structs below that the device code reads.
-#define NCCL_GIN_MRC_VERSION_CPU_RQ 7
-#define NCCL_GIN_MRC_VERSION_GPU_RQ 8
+// 9/10 (were 7/8): bare signals are zero-length Write-with-Immediate, so the sink slot, sink lkey and
+// RDW response landing are gone.
+#define NCCL_GIN_MRC_VERSION_CPU_RQ 9
+#define NCCL_GIN_MRC_VERSION_GPU_RQ 10
 
 // How receive WQEs are posted/reposted in GPU RQ mode (ncclGinMrcPeerState::post_mode). Selected by
 // the host plugin at runtime via NCCL_GIN_MRC_RQ_POST_MODE.
@@ -44,13 +46,14 @@
 // Signal ids of a context in CPU RQ mode. The signal map adds each immediate's value to the GPU slot
 // registered for its id. Each context owns one signal table, indexed by id:
 //   [0, nSignals)                 NCCL indexed signals
-//   nSignals                      sink: payload target of bare-signal writes (not in the map)
 //   rdw_signal_base + p           RDW get requests received from rank p
 //   rdw_signal_base + nRanks + p  RDW get responses from rank p (OK)
 //   rdw_signal_base + 2*nRanks+p  RDW get responses from rank p (error)
-// with rdw_signal_base = nSignals + 1. Every rank uses the same layout, so a sender addresses the
-// receiver's slot by id alone. In GPU RQ mode the table is only [0, nSignals] (signals and sink).
-#define NCCL_GIN_MRC_SIGNAL_TABLE_SIZE(nSignals, nRanks) ((nSignals) + 1 + 3 * (nRanks))
+// with rdw_signal_base = nSignals. Every rank uses the same layout, so a sender addresses the
+// receiver's slot by id alone. In GPU RQ mode the table is only [0, nSignals).
+// The NIC writes no slot (a bare signal is a zero-length Write-with-Immediate), so the table has no
+// MR: it is written only by the signal map (CPU RQ) or the device drain (GPU RQ).
+#define NCCL_GIN_MRC_SIGNAL_TABLE_SIZE(nSignals, nRanks) ((nSignals) + 3 * (nRanks))
 
 // Per-peer device state.
 //
@@ -125,15 +128,13 @@ struct ncclGinMrcGPUContext {
   // reset records the slot here instead, and the logical value of signal i is
   // signals[i] - signal_base[i]. GPU RQ mode: NULL, the device drain owns the slots.
   uint64_t* signal_base;
-  uint32_t* signal_rkeys; // [nRanks] big-endian rkeys of the peers' signal MRs
-  // Element index, within the signal MR, of this context's sink slot. MRC rejects zero-length
-  // Write-with-Immediate, so bare signals write 8 bytes there.
-  uint32_t signals_sink_offset;
   uint32_t rdw_signal_base; // CPU RQ mode, see the id layout above
+  // Nonzero when the plugin was asked not to build the self loop (NCCL_GIN_MRC_SELF_LOOP=0): the QP
+  // to the local rank is left unconnected and there is no loopback responder, so a put, signal or
+  // get to the local rank traps instead of hanging.
+  uint32_t self_loop_off;
 
   uint64_t* counters; // local indexed counters, maintained by the send-CQ drain
-
-  uint32_t sink_lkey; // big-endian lkey of a local scratch buffer we write from but never read
 
   // Receiver-Driven Write (RDW) get. MRC has no RDMA Read, so a get is a request descriptor
   // sent by Write-with-Immediate into the data owner's request ring; the owner's device progress
@@ -142,8 +143,7 @@ struct ncclGinMrcGPUContext {
   // RDW MR layout, one region per context (identical on every rank):
   //   [0, R)        request ring  [nRanks requester][rdw_window] x 128 B (written by peers)
   //   [R, 2R)       staging       [nRanks peer][rdw_window] x 128 B (local descriptors)
-  //   [2R, 2R+128)  response landing for the 8 B response payload
-  // where R = nRanks * rdw_window * 128.
+  // where R = nRanks * rdw_window * 128. A response is a zero-length Write-with-Immediate.
   struct ncclGinMrcMrTable* mr_table; // this rank's registered windows
   uint8_t* rdw_region;     // device pointer to this context's region of the local RDW MR
   uint32_t* rdw_rkeys;     // [nRanks] big-endian rkeys of the peers' RDW MRs
@@ -156,7 +156,7 @@ struct ncclGinMrcGPUContext {
   // dedicated loopback responder QP: puts and signals to self are posted on the local rank's QP and
   // their receive completions arrive on the responder. self_rq_qp is the responder (DOCA SDK
   // doca_gpu_dev_verbs_qp), whose receive queue the drain uses for the local rank. Its send queue
-  // carries no traffic, so it also hosts the Data Direct flushes below.
+  // carries no traffic, so it also hosts the Data Direct flushes below. NULL when self_loop_off.
   void* self_rq_qp;
   // GPU RQ mode. Data Direct NICs write registered windows over a direct PCIe link while CQEs reach
   // GPU memory over C2C, so a receive CQE does not imply its data is visible. When dd_flush is set,
