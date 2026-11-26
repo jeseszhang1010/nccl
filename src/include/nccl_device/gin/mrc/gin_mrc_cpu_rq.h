@@ -23,8 +23,8 @@
  * to the requester followed by a Write-with-Immediate that adds 1 to the
  * requester's OK or error response counter.
  *
- * Device code comes from the open-source DOCA GPUNetIO headers NCCL installs
- * from DOCA_HOME, shared with the GDAKI backend.
+ * Device code comes from the open-source DOCA GPUNetIO headers NCCL bundles
+ * and installs for the GDAKI backend (or from DOCA_HOME when set).
  *************************************************************************/
 
 #ifndef _NCCL_DEVICE_GIN_MRC_CPU_RQ_H_
