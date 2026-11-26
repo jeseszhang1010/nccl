@@ -152,7 +152,9 @@ else()
     doca_verbs_umem_sdk_wrapper.cpp
     doca_verbs_uar_sdk_wrapper.cpp
     doca_verbs_cq_sdk_wrapper.cpp
-    doca_verbs_qp_sdk_wrapper.cpp)
+    doca_verbs_qp_sdk_wrapper.cpp
+    gpu_dev_compat/doca_gpunetio_dev_compat.cpp
+    gpu_dev_compat/doca_gpunetio_dev_verbs_v1.cpp)
   list(TRANSFORM NIIN_GPUNETIO_OPEN_SOURCES PREPEND "${GPUNETIO_HOME}/src/")
 
   add_library(niin_gpunetio_open_obj OBJECT ${NIIN_GPUNETIO_OPEN_SOURCES})
