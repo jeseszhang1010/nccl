@@ -148,9 +148,9 @@ NVCUFLAGS_GENK :=
 ########## MRC GIN backend ##########
 # Opt-in with GIN_MRC=1. Selects the MRC GIN device backend and disables GDAKI (see
 # gin_device_common.h). The receive queues are managed by the CPU (the MRC GIN host plugin drains
-# them); device code uses the open-source GPUNetIO device headers from DOCA_HOME, which must have
-# doca_gpu_dev_verbs_put_immediate (e.g. the GPUNetIO main branch). The MRC GIN host plugin owns
-# the host-side DOCA code.
+# them); device code uses the open-source GPUNetIO device headers GDAKI uses (DOCA_HOME, by default
+# the copy NCCL bundles), which must have doca_gpu_dev_verbs_put_immediate. The MRC GIN host plugin
+# owns the host-side DOCA code.
 GIN_MRC ?= 0
 ifeq ($(GIN_MRC),1)
   GIN_MRC_FLAGS := -DNCCL_GIN_MRC_ENABLE=1

@@ -20,7 +20,7 @@
 
 // MRC QPs have no atomics: a signal is the immediate of an RDMA Write-with-Immediate, so every QP
 // has a receive queue. The receive queues are managed by the CPU: device code from the open-source
-// GPUNetIO (DOCA_HOME) posts with doca_gpu_dev_verbs_put_immediate, and the plugin drains the
+// GPUNetIO NCCL bundles posts with doca_gpu_dev_verbs_put_immediate, and the plugin drains the
 // receive queues into per-context signal maps, with the semantics of the open-source
 // doca_gpu_verbs_rq_progress.
 // NCCL passes this version to the plugin's createContext as the backend version; it is the layout
